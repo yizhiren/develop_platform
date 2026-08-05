@@ -13,6 +13,8 @@
 
 Provider 包括默认测试使用的 `FakeLLMProvider` 和支持 Chat Completions JSON Output 的 `OpenAICompatibleProvider`。DeepSeek 默认模型为 `deepseek-v4-flash`。
 
+模型配置按稳定身份 `agent1` 至 `agent4` 解析，而不是按临时工作流阶段解析：澄清阶段使用 Agent1；方案、修订和 Code Review 使用 Agent2；开发使用 Agent3；验收、逐仓组合回归和最终验收使用 Agent4。每个身份可覆盖 Provider、Base URL、模型和 API Key；未设置的字段回退到共享 `LLM_*`/`DEEPSEEK_API_KEY`。控制平面只接收 Provider/Base URL/模型用于调度记录，不接收角色 API Key；所有 Key 只进入 Agent Worker，并在 Entrypoint 中转成一次性文件后从 PID 1 环境移除。
+
 当前实现使用非流式 JSON Output。开发 Agent 通过应用层工具循环逐步输出一个 `DeveloperAction`，可列目录、读写/精确替换/删除文件、运行白名单测试命令或结束。每个动作都由服务端校验；模型不能直接调用操作系统或 Git。测试命令经 Unix Socket 交给无网络 Sandbox Executor 执行。结束前至少要有一个真实成功的测试命令，最终 `DevelopmentReport.tests` 由执行器用实际结果覆盖，不能由模型自行声称通过。
 
 方案阶段启动前，可信 Git Worker 对每个目标仓库执行只读 fresh clone，记录目标分支 head SHA、受限文件树、文件类型统计和限额截取的 README、manifest、入口及文档内容，生成 `repository_analysis`。仓库内容始终标记为不可信输入，Agent2 只能据此设计，不能获得 Git 凭据或写权限。

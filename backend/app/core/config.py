@@ -1,8 +1,21 @@
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from ..agents.roles import AGENT_KEYS
+
+
+@dataclass(frozen=True)
+class AgentModelConfig:
+    agent_key: str
+    provider: str
+    base_url: str
+    model: str
+    api_key: str = field(repr=False)
+    api_key_file: Path | None
 
 
 class Settings(BaseSettings):
@@ -10,7 +23,7 @@ class Settings(BaseSettings):
         env_file=(".env.local", ".env"), env_file_encoding="utf-8", extra="ignore"
     )
 
-    app_name: str = "ForgeFlow"
+    app_name: str = "画板"
     app_env: str = "development"
     app_secret: str = "development-only-change-me-32-chars"
     database_path: Path = Path("data/forgeflow.db")
@@ -27,6 +40,30 @@ class Settings(BaseSettings):
     llm_model: str = "deepseek-v4-flash"
     deepseek_api_key: str = Field(default="", repr=False)
     deepseek_api_key_file: Path | None = None
+
+    agent1_llm_provider: str = ""
+    agent1_llm_base_url: str = ""
+    agent1_llm_model: str = ""
+    agent1_llm_api_key: str = Field(default="", repr=False)
+    agent1_llm_api_key_file: Path | None = None
+
+    agent2_llm_provider: str = ""
+    agent2_llm_base_url: str = ""
+    agent2_llm_model: str = ""
+    agent2_llm_api_key: str = Field(default="", repr=False)
+    agent2_llm_api_key_file: Path | None = None
+
+    agent3_llm_provider: str = ""
+    agent3_llm_base_url: str = ""
+    agent3_llm_model: str = ""
+    agent3_llm_api_key: str = Field(default="", repr=False)
+    agent3_llm_api_key_file: Path | None = None
+
+    agent4_llm_provider: str = ""
+    agent4_llm_base_url: str = ""
+    agent4_llm_model: str = ""
+    agent4_llm_api_key: str = Field(default="", repr=False)
+    agent4_llm_api_key_file: Path | None = None
     run_live_ai_tests: bool = False
     live_ai_max_requests: int = 20
 
@@ -56,6 +93,19 @@ class Settings(BaseSettings):
         path = self.database_path.expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{path}"
+
+    def agent_model_config(self, agent_key: str) -> AgentModelConfig:
+        if agent_key not in AGENT_KEYS:
+            raise ValueError(f"unsupported agent key: {agent_key}")
+        prefix = f"{agent_key}_llm_"
+        return AgentModelConfig(
+            agent_key=agent_key,
+            provider=getattr(self, f"{prefix}provider") or self.llm_provider,
+            base_url=getattr(self, f"{prefix}base_url") or self.llm_base_url,
+            model=getattr(self, f"{prefix}model") or self.llm_model,
+            api_key=getattr(self, f"{prefix}api_key") or self.deepseek_api_key,
+            api_key_file=getattr(self, f"{prefix}api_key_file") or self.deepseek_api_key_file,
+        )
 
 
 @lru_cache

@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 
 from .agents.providers import FakeLLMProvider, OpenAICompatibleProvider
 from .agents.coding import DeveloperToolLoop
+from .agents.roles import AGENT_KEYS, agent_key_for_role
 from .agents.runtime import AgentOutputError, AgentRuntime, ModelProviderError
 from .agents.verification import run_recorded_tests
 from .core.config import get_settings
@@ -19,29 +20,54 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forgeflow.worker")
 
 
-def build_runtime() -> AgentRuntime:
+def build_runtimes() -> dict[str, AgentRuntime]:
     settings = get_settings()
-    model_api_key = _read_model_api_key(settings.deepseek_api_key, settings.deepseek_api_key_file)
-    if settings.llm_provider == "fake":
-        return AgentRuntime(FakeLLMProvider())
-    return AgentRuntime(
-        OpenAICompatibleProvider(
-            settings.llm_base_url,
-            model_api_key,
-            settings.llm_model,
+    secret_cache: dict[Path, str] = {}
+    runtimes: dict[str, AgentRuntime] = {}
+    for agent_key in AGENT_KEYS:
+        profile = settings.agent_model_config(agent_key)
+        model_api_key = _read_model_api_key(
+            profile.api_key,
+            profile.api_key_file,
+            secret_cache,
         )
-    )
+        if profile.provider == "fake":
+            runtimes[agent_key] = AgentRuntime(FakeLLMProvider())
+        else:
+            runtimes[agent_key] = AgentRuntime(
+                OpenAICompatibleProvider(
+                    profile.base_url,
+                    model_api_key,
+                    profile.model,
+                    thinking_enabled=False if profile.provider == "deepseek" else None,
+                )
+            )
+    return runtimes
 
 
-def _read_model_api_key(direct_value: str, key_file: Path | None) -> str:
+def build_runtime() -> AgentRuntime:
+    """Backward-compatible helper for callers that only need Agent1."""
+    return build_runtimes()["agent1"]
+
+
+def _read_model_api_key(
+    direct_value: str,
+    key_file: Path | None,
+    cache: dict[Path, str] | None = None,
+) -> str:
     if direct_value:
         return direct_value
     if key_file is None:
         return ""
+    resolved = key_file.resolve()
+    if cache is not None and resolved in cache:
+        return cache[resolved]
     try:
         value = key_file.read_text().strip()
     finally:
         key_file.unlink(missing_ok=True)
+    if cache is not None:
+        cache[resolved] = value
     return value
 
 
@@ -56,7 +82,7 @@ async def run_worker() -> None:
     except Exception as exc:
         if "BUSYGROUP" not in str(exc):
             raise
-    runtime = build_runtime()
+    runtimes = build_runtimes()
     logger.info("worker started: %s", worker_id)
     while True:
         claimed = await redis.xautoclaim(stream_name, group, worker_id, settings.task_lease_seconds * 1000, "0-0", count=1)
@@ -82,6 +108,7 @@ async def run_worker() -> None:
                     await lease.complete()
                     continue
                 role = task_type.split(".", 1)[1]
+                runtime = runtimes[agent_key_for_role(role)]
                 context = envelope["payload"].get("context", {})
                 try:
                     if role == "develop" and context.get("artifacts", {}).get("workspace_manifest"):

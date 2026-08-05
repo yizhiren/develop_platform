@@ -101,7 +101,7 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(task, return_exceptions=True)
 
 
-app = FastAPI(title="ForgeFlow Control Plane", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="画板 Control Plane", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.web_origin],

@@ -15,7 +15,7 @@ GITHUB_TOKEN=...
 REPOSITORY_AUTOMATION_ENABLED=1
 ```
 
-ForgeFlow 用 `x-access-token` 作为 HTTPS Basic 用户名，通过临时 `http.extraHeader` 传入 Token，不会修改仓库 remote URL。
+画板用 `x-access-token` 作为 HTTPS Basic 用户名，通过临时 `http.extraHeader` 传入 Token，不会修改仓库 remote URL。
 
 ## GitLab
 
@@ -27,7 +27,7 @@ GITLAB_TOKEN=...
 REPOSITORY_AUTOMATION_ENABLED=1
 ```
 
-GitLab.com 使用 `https://gitlab.com`。ForgeFlow 对 API 使用 Bearer Token，对 Git HTTPS 使用 `oauth2` 用户名和临时认证 Header。
+GitLab.com 使用 `https://gitlab.com`。画板对 API 使用 Bearer Token，对 Git HTTPS 使用 `oauth2` 用户名和临时认证 Header。
 
 ## 上线前检查
 
@@ -35,4 +35,4 @@ GitLab.com 使用 `https://gitlab.com`。ForgeFlow 对 API 使用 Bearer Token�
 2. 连接仓库，发布只改一行文档并带一个自动化测试的需求。
 3. 确认工作分支、PR/MR、head SHA、Diff、CI 状态与控制台显示一致。
 4. 人工确认合并，验证目标分支 SHA 和最终验收产物。
-5. 删除测试分支、撤销测试 Token，检查 ForgeFlow 日志和 Git 配置中没有 Token。
+5. 删除测试分支、撤销测试 Token，检查画板日志和 Git 配置中没有 Token。

@@ -1,4 +1,4 @@
-# ForgeFlow 文档索引
+# 画板文档索引
 
 ## 产品与架构
 
@@ -26,5 +26,6 @@
 - [里程碑 2](process/milestone-2.md)
 - [里程碑 3](process/milestone-3.md)
 - [里程碑 4](process/milestone-4.md)
+- [里程碑 5](process/milestone-5.md)
 
 文档使用中文描述产品和决策，接口字段和代码符号使用英文。图表使用 Mermaid，以便与代码一同评审和版本化。

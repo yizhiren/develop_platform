@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 - 2026-08-05
+
+- 产品名称由 ForgeFlow 更新为“画板”，保留数据库、队列、Cookie 和 Compose Volume 的内部兼容标识。
+- 登录页与工作台侧栏采用木质画架透明 PNG 品牌 Logo，并保留原始手绘质感。
+- Agent1 至 Agent4 支持分别配置 Provider、Base URL、模型和 API Key，并支持共享 DeepSeek 配置回退。
+- 多角色 Key 在 Worker 启动时转为一次性文件并从 PID 1 环境移除。
+
 ## 2026-08-05
 
 - 建立 ForgeFlow Web、FastAPI 控制平面、SQLite WAL、Redis Streams 与 Docker Compose。

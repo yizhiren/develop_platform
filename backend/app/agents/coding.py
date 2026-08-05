@@ -63,7 +63,16 @@ class DeveloperToolLoop:
                 "observation": observation,
                 "step": step,
                 "steps_remaining": self.max_steps - step + 1,
+                "completion_instruction": (
+                    "已有成功测试。若没有尚未执行的必要修改，立即返回 finish，并填写准确的 report；不要重复读取或测试。"
+                    if successful_tests
+                    else "继续检查、修改并运行相关测试；尚不能 finish。"
+                ),
             }
+            if self.max_steps - step + 1 <= 2 and successful_tests:
+                user_payload["completion_instruction"] = (
+                    "步骤即将耗尽。下一响应必须是 finish，report.repositories_changed 必须填写实际修改的 repository_id。"
+                )
             response = await self.provider.complete(system, json.dumps(user_payload, ensure_ascii=False))
             prompt_tokens += response.prompt_tokens
             completion_tokens += response.completion_tokens
@@ -103,7 +112,11 @@ class DeveloperToolLoop:
                     completion_tokens=completion_tokens,
                     model=model,
                 )
-        raise AgentOutputError("developer tool loop exhausted its step budget")
+        action_trace = ",".join(str(item.get("action", "unknown")) for item in transcript)
+        raise AgentOutputError(
+            "developer tool loop exhausted its step budget "
+            f"(successful_tests={len(successful_tests)}, actions={action_trace})"
+        )
 
     @staticmethod
     def _execute(action: DeveloperAction, sandbox: WorkspaceSandbox) -> dict[str, Any]:

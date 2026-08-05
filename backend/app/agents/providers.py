@@ -65,7 +65,7 @@ class FakeLLMProvider(LLMProvider):
 
 
 class OpenAICompatibleProvider(LLMProvider):
-    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 120.0, max_tokens: int = 4096, thinking_enabled: bool = False):
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 120.0, max_tokens: int = 4096, thinking_enabled: bool | None = False):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
@@ -76,14 +76,15 @@ class OpenAICompatibleProvider(LLMProvider):
     async def complete(self, system: str, user: str) -> ModelResponse:
         if not self.api_key:
             raise ModelProviderError("model.missing_api_key", "model API key is not configured")
-        body = {
+        body: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "response_format": {"type": "json_object"},
             "stream": False,
             "max_tokens": self.max_tokens,
-            "thinking": {"type": "enabled" if self.thinking_enabled else "disabled"},
         }
+        if self.thinking_enabled is not None:
+            body["thinking"] = {"type": "enabled" if self.thinking_enabled else "disabled"}
         for attempt in range(2):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:

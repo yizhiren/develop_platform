@@ -1,6 +1,6 @@
-# ForgeFlow AI 开发平台
+# 画板 AI 开发平台
 
-ForgeFlow 是一个面向团队的多项目、多仓库 AI 开发平台。每个需求由四个专业 Agent 按固定流程协作：需求澄清、架构设计、开发与测试、架构评审、独立验收，最终由项目负责人逐仓确认合并。
+画板是一个面向团队的多项目、多仓库 AI 开发平台。每个需求由四个专业 Agent 按固定流程协作：需求澄清、架构设计、开发与测试、架构评审、独立验收，最终由项目负责人逐仓确认合并。
 
 当前仓库同时包含：
 
@@ -17,6 +17,8 @@ ForgeFlow 是一个面向团队的多项目、多仓库 AI 开发平台。每个
 4. 打开 `http://localhost:3000`，API 文档位于 `http://localhost:8000/docs`。
 
 默认管理员由首次启动配置创建。DeepSeek 真实测试只有在显式设置 `RUN_LIVE_AI_TESTS=1` 时才会运行；普通测试使用确定性的 Fake Provider。
+
+四个 Agent 可分别配置 `AGENT1_` 至 `AGENT4_` 的模型、OpenAI-compatible Base URL 和 API Key。角色项留空时回退到共享的 `LLM_*` 与 `DEEPSEEK_API_KEY`；当前本地配置四者都使用 DeepSeek 和同一个共享 Key。
 
 常用验证：
 

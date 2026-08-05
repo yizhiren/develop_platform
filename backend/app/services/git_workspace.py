@@ -68,10 +68,10 @@ class GitWorkspaceManager:
                 self.root,
                 env,
             )
-            work_branch = f"forgeflow/req-{requirement_id[:12]}"
+            work_branch = f"huaban/req-{requirement_id[:12]}"
             self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
-            self._run(["git", "config", "user.name", "ForgeFlow Developer Agent"], target, env)
-            self._run(["git", "config", "user.email", "agent@forgeflow.local"], target, env)
+            self._run(["git", "config", "user.name", "画板 Developer Agent"], target, env)
+            self._run(["git", "config", "user.email", "agent@huaban.local"], target, env)
             self._run(["git", "checkout", "-B", work_branch], target, env)
             baseline_sha = self._run(["git", "rev-parse", "HEAD"], target, env).strip()
             manifests.append(
@@ -288,7 +288,7 @@ class GitWorkspaceManager:
                         item["full_name"],
                         item["work_branch"],
                         item["target_branch"],
-                        f"[ForgeFlow] {context['title']}",
+                        f"[画板] {context['title']}",
                         _pull_request_body(context),
                     )
                 finally:
@@ -351,8 +351,8 @@ class GitWorkspaceManager:
             env,
         )
         self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
-        self._run(["git", "config", "user.name", "ForgeFlow Developer Agent"], target, env)
-        self._run(["git", "config", "user.email", "agent@forgeflow.local"], target, env)
+        self._run(["git", "config", "user.name", "画板 Developer Agent"], target, env)
+        self._run(["git", "config", "user.email", "agent@huaban.local"], target, env)
         self._run(["git", "checkout", "-B", manifest_item["work_branch"]], target, env)
         _sync_untrusted_worktree(developer_root, target)
         return target
@@ -435,8 +435,8 @@ def _safe_id(value: str) -> str:
 
 def _pull_request_body(context: dict[str, Any]) -> str:
     report = context.get("artifacts", {}).get("development_report", {})
-    summary = report.get("summary", "Automated implementation produced by ForgeFlow.")
-    return f"## ForgeFlow delivery\n\n{summary}\n\nRequirement: `{context['requirement_id']}`\n"
+    summary = report.get("summary", "Automated implementation produced by 画板.")
+    return f"## 画板 delivery\n\n{summary}\n\nRequirement: `{context['requirement_id']}`\n"
 
 
 def _sync_untrusted_worktree(source: Path, destination: Path) -> None:

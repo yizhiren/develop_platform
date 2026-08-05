@@ -17,6 +17,7 @@ from ..models.entities import (
     WorkflowTransition,
 )
 from ..core.config import get_settings
+from ..agents.roles import ROLE_TO_AGENT_KEY
 
 
 class WorkflowError(ValueError):
@@ -109,18 +110,6 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
 }
 
 PAUSABLE = set(RULES) - {RequirementStatus.BLOCKED}
-AGENT_IDENTITIES = {
-    "clarify": "agent1",
-    "architect": "agent2",
-    "review": "agent2",
-    "revise": "agent2",
-    "develop": "agent3",
-    "accept": "agent4",
-    "final_accept": "agent4",
-    "regression": "agent4",
-}
-
-
 def transition_requirement(
     session: Session,
     requirement: Requirement,
@@ -202,11 +191,13 @@ def transition_requirement(
             context.update(task_context)
         agent_run = None
         if role:
+            agent_key = ROLE_TO_AGENT_KEY[role]
+            model_profile = settings.agent_model_config(agent_key)
             agent_run = AgentRun(
                 requirement_id=requirement.id,
-                agent_key=AGENT_IDENTITIES[role],
+                agent_key=agent_key,
                 role=role,
-                model=get_settings().llm_model if get_settings().llm_provider != "fake" else "fake",
+                model=model_profile.model if model_profile.provider != "fake" else "fake",
                 input_json=json.dumps(context, ensure_ascii=False),
             )
             session.add(agent_run)

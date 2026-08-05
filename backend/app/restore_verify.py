@@ -9,7 +9,7 @@ from .backup import verify_restore
 def main() -> None:
     backups = sorted(Path("/backups").glob("forgeflow-*.db"))
     if not backups:
-        raise RuntimeError("no ForgeFlow backup was found")
+        raise RuntimeError("no compatible 画板 backup was found")
     destination = Path("/tmp/forgeflow-restored.db")
     destination.unlink(missing_ok=True)
     result = verify_restore(backups[-1], destination)

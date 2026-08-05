@@ -35,6 +35,22 @@ def test_happy_path_schedules_clarifier() -> None:
     assert session.get(AgentRun, task.agent_run_id).agent_key == "agent1"
 
 
+def test_agent_run_records_the_model_configured_for_its_stable_identity(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    settings = Settings(
+        _env_file=None,
+        llm_provider="deepseek",
+        llm_model="shared-model",
+        agent1_llm_model="clarifier-model",
+    )
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(session, requirement, "publish", 1, "user", requirement.owner_id)
+    run = session.get(AgentRun, task.agent_run_id)
+    assert run.agent_key == "agent1"
+    assert run.model == "clarifier-model"
+
+
 def test_version_conflict_is_rejected() -> None:
     session, requirement = session_with_requirement()
     try:

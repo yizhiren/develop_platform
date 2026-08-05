@@ -1,7 +1,7 @@
 [project]
-name = "forgeflow-backend"
+name = "huaban-backend"
 version = "0.1.0"
-description = "ForgeFlow control plane and agent workers"
+description = "画板 control plane and agent workers"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi==0.116.1",

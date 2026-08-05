@@ -13,7 +13,8 @@ button:disabled { cursor: not-allowed; opacity: .5; }
 .login-shell { min-height: 100vh; display: grid; grid-template-columns: 1.2fr .8fr; background: var(--ink); }
 .login-story { padding: 72px; color: white; display: flex; flex-direction: column; justify-content: center; position: relative; overflow: hidden; }
 .login-story::before { content: ""; position: absolute; width: 560px; height: 560px; border: 1px solid #ffffff24; border-radius: 50%; right: -220px; top: -120px; box-shadow: 0 0 0 80px #ffffff08, 0 0 0 160px #ffffff05; }
-.brand-mark { width: 52px; height: 52px; display: grid; place-items: center; border: 1px solid #ffffff77; font: 800 25px var(--font-geist-mono); margin-bottom: 80px; }
+.brand-mark { width: 76px; height: 92px; display: grid; place-items: center; margin-bottom: 68px; }
+.brand-mark img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(0 8px 18px #00000045); }
 .login-story .eyebrow { color: var(--cyan); }
 .login-story h1 { font-size: clamp(48px, 5vw, 78px); line-height: .98; max-width: 760px; margin: 0; letter-spacing: -.055em; }
 .hero-copy { max-width: 650px; margin: 30px 0 44px; color: #bbc0bd; font-size: 17px; line-height: 1.8; }
@@ -41,7 +42,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--ink); box-shadow
 .workspace { min-height: 100vh; display: grid; grid-template-columns: 236px 1fr; }
 .sidebar { position: fixed; inset: 0 auto 0 0; width: 236px; background: var(--ink); color: white; padding: 28px 20px; display: flex; flex-direction: column; z-index: 10; }
 .brand { display: flex; align-items: center; gap: 12px; font-size: 17px; font-weight: 800; }
-.brand > span { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid #ffffff77; font-family: var(--font-geist-mono); }
+.brand > span { width: 38px; height: 44px; display: grid; place-items: center; flex: 0 0 auto; }
+.brand-logo img { width: 100%; height: 100%; object-fit: contain; }
 .brand small, .profile small, .system-card small { display: block; color: #7f8784; font: 500 9px/1.4 var(--font-geist-mono); letter-spacing: .12em; }
 .sidebar nav { display: grid; gap: 7px; margin-top: 55px; }
 .sidebar nav a { text-decoration: none; color: #959c99; padding: 11px 12px; border-radius: 3px; font-size: 13px; display: flex; gap: 12px; align-items: center; }

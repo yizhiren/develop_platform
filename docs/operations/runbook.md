@@ -6,6 +6,19 @@
 
 要启用真实仓库自动化，设置 `REPOSITORY_AUTOMATION_ENABLED=1`，配置对应 Provider Token，并保持 `ALLOW_LOCAL_GIT=0`。`ALLOW_LOCAL_GIT=1` 仅用于临时裸仓测试。工作区位于 Docker `workspaces` Volume，不应映射宿主机源码目录。
 
+## 四 Agent 模型配置
+
+共享默认配置使用 `LLM_PROVIDER`、`LLM_BASE_URL`、`LLM_MODEL` 和 `DEEPSEEK_API_KEY`。每个稳定 Agent 身份可以用以下前缀独立覆盖：
+
+| 身份 | 阶段 | 配置前缀 |
+| --- | --- | --- |
+| Agent1 | 需求澄清 | `AGENT1_LLM_` |
+| Agent2 | 架构、方案修订、Code Review | `AGENT2_LLM_` |
+| Agent3 | 开发与测试 | `AGENT3_LLM_` |
+| Agent4 | 验收、组合回归、最终验收 | `AGENT4_LLM_` |
+
+每个前缀支持 `PROVIDER`、`BASE_URL`、`MODEL`、`API_KEY`。角色字段为空时逐项回退到共享配置，因此当前只需在 `.env.local` 保存一次 `DEEPSEEK_API_KEY`，四个角色即可使用同一个 Key。若某一角色需要独立 Key，只设置对应的 `AGENTn_LLM_API_KEY`。修改后重新创建 `control-plane` 和 `agent-worker`；Key 不得写入 `.env.example`。
+
 ## 健康检查
 
 - Web：`/`

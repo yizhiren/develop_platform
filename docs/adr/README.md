@@ -9,3 +9,4 @@
 - [0007 内置 SQLite 迁移与工作区租约](0007-migrations-and-workspace-leases.md)
 - [0008 断网 Sandbox Executor](0008-networkless-sandbox-executor.md)
 - [0009 分布式需求租约与内容寻址证据](0009-leases-and-evidence.md)
+- [0010 四 Agent 独立模型配置](0010-per-agent-model-profiles.md)

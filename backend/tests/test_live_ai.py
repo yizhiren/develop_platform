@@ -10,6 +10,7 @@ from app.agents.runtime import AgentRuntime, ROLE_SCHEMAS
 from app.core.config import Settings
 from app.providers.git import GitProvider, PullRequestRef
 from app.services.git_workspace import GitWorkspaceManager
+from app.worker import build_runtimes
 
 
 pytestmark = [
@@ -45,7 +46,35 @@ async def test_deepseek_agent_protocols(role: str) -> None:
     assert response.model
 
 
-async def test_deepseek_developer_tool_loop_changes_code_and_runs_tests(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("agent_key", "role"),
+    [
+        ("agent1", "clarify"),
+        ("agent2", "architect"),
+        ("agent3", "develop"),
+        ("agent4", "accept"),
+    ],
+)
+async def test_each_configured_agent_profile_reaches_its_model(agent_key: str, role: str) -> None:
+    runtime = build_runtimes()[agent_key]
+    output, response = await runtime.run(
+        role,
+        {
+            "title": "验证独立 Agent 模型配置",
+            "description": "只验证当前角色能够使用自己的模型配置返回结构化 JSON。",
+            "test_mode": True,
+        },
+    )
+    assert isinstance(output, ROLE_SCHEMAS[role])
+    assert response.model
+
+
+async def test_deepseek_developer_tool_loop_changes_code_and_runs_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This standalone test container does not mount the production executor socket.
+    monkeypatch.delenv("SANDBOX_EXECUTOR_SOCKET", raising=False)
     source = tmp_path / "source"
     remote = tmp_path / "remote.git"
     source.mkdir()

@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type Project = { id: string; key: string; name: string; description: string };
@@ -141,8 +142,10 @@ export default function Home() {
     return (
       <main className="login-shell">
         <section className="login-story">
-          <div className="brand-mark">F</div>
-          <p className="eyebrow">FORGEFLOW · AI DELIVERY SYSTEM</p>
+          <div className="brand-mark">
+            <Image src="/huaban-logo.png" alt="画板 Logo" width={251} height={320} priority unoptimized />
+          </div>
+          <p className="eyebrow">画板 · AI DELIVERY SYSTEM</p>
           <h1>让每个需求，都有一支完整的工程团队。</h1>
           <p className="hero-copy">四个专业 Agent 在可审计的流程里澄清、设计、开发、评审与验收。人负责方向和最终决定，系统负责把过程做扎实。</p>
           <div className="agent-ribbon">
@@ -170,7 +173,10 @@ export default function Home() {
   return (
     <main className="workspace">
       <aside className="sidebar">
-        <div className="brand"><span>F</span><div>ForgeFlow<small>AI DELIVERY</small></div></div>
+        <div className="brand">
+          <span className="brand-logo"><Image src="/huaban-logo.png" alt="" width={251} height={320} unoptimized /></span>
+          <div>画板<small>AI DELIVERY</small></div>
+        </div>
         <nav>
           <a className="active" href="#overview"><i>⌂</i>总览</a>
           <a href="#requirements"><i>◇</i>需求</a>
