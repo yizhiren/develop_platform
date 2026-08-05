@@ -4,7 +4,18 @@
 
 主机仅要求 Docker Desktop。复制 `.env.example` 为 `.env.local` 后执行 `./scripts/start-local.sh`。模型和 Git Secret 不写入 Compose 文件。
 
-要启用真实仓库自动化，设置 `REPOSITORY_AUTOMATION_ENABLED=1`，配置对应 Provider Token，并保持 `ALLOW_LOCAL_GIT=0`。`ALLOW_LOCAL_GIT=1` 仅用于临时裸仓测试。工作区位于 Docker `workspaces` Volume，不应映射宿主机源码目录。
+要启用真实仓库自动化，设置 `REPOSITORY_AUTOMATION_ENABLED=1`，配置对应 Provider Token，并保持 `ALLOW_LOCAL_GIT=0`。`ALLOW_LOCAL_GIT=1` 仅用于临时裸仓测试。Git 网络操作全部在 `git-worker` 执行。
+
+本地默认挂载如下：
+
+```dotenv
+HOST_WORKSPACE_ROOT=./data/workspaces
+HOST_SSH_DIR=/Users/your-name/.ssh
+```
+
+`HOST_WORKSPACE_ROOT` 相对 Compose 项目目录解析，当前默认绝对位置是 `/Users/qiming/code/develop_platform/data/workspaces`。目录结构为 `<requirement_id>/<repository_id>/`，另有 `.publishing/` 可信发布副本和 `.leases/` 租约。该目录被 Git 忽略，但包含真实业务源码；不要放入云盘同步目录。
+
+`HOST_SSH_DIR` 只读挂载到 `git-worker:/home/forgeflow/.ssh`。Agent Worker 和 Sandbox Executor 不挂载它。启动前执行 `ssh -T git@github.com` 并确认 `known_hosts`、私钥权限和非交互认证可用；有密码且未通过 Agent 解锁的私钥会在 `BatchMode` 下失败。
 
 ## 四 Agent 模型配置
 

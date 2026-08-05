@@ -7,6 +7,19 @@ x-control-env: &control-env
   REDIS_URL: redis://redis:6379/0
   WEB_ORIGIN: http://localhost:3000
 
+x-workspace-volume: &workspace-volume
+  type: bind
+  source: ${HOST_WORKSPACE_ROOT:-./data/workspaces}
+  target: /workspaces
+
+x-host-ssh-volume: &host-ssh-volume
+  type: bind
+  source: ${HOST_SSH_DIR:-${HOME}/.ssh}
+  target: /home/forgeflow/.ssh
+  read_only: true
+  bind:
+    create_host_path: false
+
 services:
   storage-init:
     image: redis:7.4-alpine
@@ -17,7 +30,7 @@ services:
       - sqlite-data:/data
       - artifacts:/artifacts
       - backups:/backups
-      - workspaces:/workspaces
+      - *workspace-volume
       - sandbox-runtime:/runtime
     security_opt:
       - no-new-privileges:true
@@ -121,7 +134,7 @@ services:
         condition: service_started
     read_only: true
     volumes:
-      - workspaces:/workspaces
+      - *workspace-volume
       - sandbox-runtime:/runtime
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -145,7 +158,7 @@ services:
         condition: service_completed_successfully
     read_only: true
     volumes:
-      - workspaces:/workspaces
+      - *workspace-volume
       - sandbox-runtime:/runtime
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -174,7 +187,8 @@ services:
         condition: service_healthy
     read_only: true
     volumes:
-      - workspaces:/workspaces
+      - *workspace-volume
+      - *host-ssh-volume
     tmpfs:
       - /tmp:size=64m,mode=1777
     security_opt:
@@ -218,7 +232,7 @@ services:
       WORKSPACE_ROOT: /workspaces
       WORKSPACE_TTL_HOURS: ${WORKSPACE_TTL_HOURS:-72}
     volumes:
-      - workspaces:/workspaces
+      - *workspace-volume
     profiles: ["tools"]
 
   restore-verify:
@@ -261,5 +275,4 @@ volumes:
   redis-data:
   artifacts:
   backups:
-  workspaces:
   sandbox-runtime:

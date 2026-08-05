@@ -19,7 +19,9 @@ Provider 包括默认测试使用的 `FakeLLMProvider` 和支持 Chat Completion
 
 方案阶段启动前，可信 Git Worker 对每个目标仓库执行只读 fresh clone，记录目标分支 head SHA、受限文件树、文件类型统计和限额截取的 README、manifest、入口及文档内容，生成 `repository_analysis`。仓库内容始终标记为不可信输入，Agent2 只能据此设计，不能获得 Git 凭据或写权限。
 
-可信 Git Worker 在方案确认后 clone 目标分支、关闭仓库 hooks、创建需求工作分支并产生 `workspace_manifest`。开发完成后，它扫描 Diff、提交、使用临时 HTTP Header 推送，并创建或更新 PR/MR，产出包含基线 SHA、head SHA、PR/MR 与实际 Diff 的 `delivery_manifest`。Review Agent 只能在该产物生成后启动。
+可信 Git Worker 在方案确认后 clone 目标分支、关闭仓库 hooks、创建需求工作分支并产生 `workspace_manifest`。开发完成后，它扫描 Diff、提交、通过已连接仓库的 SSH URL 或临时 HTTPS Header 推送，并创建或更新 PR/MR，产出包含基线 SHA、head SHA、PR/MR 与实际 Diff 的 `delivery_manifest`。所有 Git 网络命令都在 Git Worker 内执行；Agent Worker 只能编辑共享工作区的普通文件。Review Agent 只能在该产物生成后启动。
+
+Compose 将主机 `${HOST_WORKSPACE_ROOT:-./data/workspaces}` 绑定为 `/workspaces`，因此运维人员可以直接查看 `<requirement_id>/<repository_id>/` 下的 checkout。主机 `${HOST_SSH_DIR:-$HOME/.ssh}` 只读挂载到 Git Worker 的 `/home/forgeflow/.ssh`；Agent Worker 和 Sandbox Executor 只挂载工作区，不挂载 SSH 目录。
 
 验收启动前，可信 Git Worker 从已推送工作分支重新 clone，并校验 checkout HEAD 与 `delivery_manifest.head_sha` 完全一致；每次非末仓合并后，组合回归从已合并仓库目标分支和未合并仓库交付分支 fresh clone；最终验收则从全部目标分支重新 clone，并校验合并返回 SHA。平台在这些干净 checkout 中复跑开发报告记录的测试。任何复跑失败都会强制把 `AcceptanceReport.approved` 改为 `false`，模型不能覆盖执行器结论。跨仓测试目前是在同一需求验证根目录的多个仓库子目录中执行，不包含业务专用 Compose 编排。
 

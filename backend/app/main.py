@@ -40,6 +40,7 @@ from .models.entities import (
     WebhookDelivery,
     WorkflowTransition,
 )
+from .providers.git import GitProviderError
 from .schemas.domain import (
     LoginRequest,
     MessageCreate,
@@ -62,6 +63,7 @@ from .schemas.domain import (
 )
 from .services.outbox import OutboxScheduler
 from .services.artifacts import ArtifactStore, ArtifactStoreError
+from .services.repository_urls import expected_provider_host, validate_clone_url
 from .services.workflow import VersionConflict, WorkflowError, transition_requirement
 
 
@@ -332,22 +334,21 @@ def create_repository(
 
 
 def _validate_repository_urls(payload: RepositoryCreate) -> None:
-    clone = urlparse(payload.clone_url)
     web = urlparse(payload.web_url)
-    expected_host = "github.com" if payload.provider == "github" else (urlparse(settings.gitlab_base_url).hostname or "").lower()
+    expected_host = expected_provider_host(payload.provider, settings.gitlab_base_url)
+    try:
+        validate_clone_url(payload.provider, payload.clone_url, settings.gitlab_base_url)
+    except GitProviderError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     if (
-        clone.scheme != "https"
-        or clone.username
-        or clone.password
-        or (clone.hostname or "").lower() != expected_host
-        or web.scheme != "https"
+        web.scheme != "https"
         or web.username
         or web.password
         or (web.hostname or "").lower() != expected_host
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "repository URLs must be credential-free HTTPS URLs on the configured provider host",
+            "web URL must be credential-free HTTPS on the configured provider host",
         )
     if payload.full_name.count("/") < 1 or payload.full_name.startswith("/") or payload.full_name.endswith("/"):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "repository full_name must include owner and repository")

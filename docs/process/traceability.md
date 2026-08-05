@@ -20,3 +20,4 @@
 | 全局并发上限 | 总体架构、ADR-0009 | Redis 需求租约、心跳与 TTL 释放 | 真实 Redis 上限 1 阻塞/释放/接管演练通过 |
 | 大型证据不可变保存 | 数据模型、ADR-0009 | SHA-256 内容寻址 Artifact Store + RBAC 下载 | 摘要去重、路径逃逸、Diff 外置测试通过 |
 | 四 Agent 独立模型配置 | Agent Runtime、ADR-0010 | 稳定身份配置解析、共享回退与独立 Key 文件 | 单元测试、四角色 DeepSeek 实时请求、PID 1/临时文件检查通过 |
+| 主机可见仓库与 SSH Push 容器 | 总体架构、ADR-0011 | Git Worker 独占 Git 网络操作；主机工作区绑定挂载；`.ssh` 只读单向挂载 | Compose 路径展开、SSH URL 校验、容器读写/凭据边界与真实 GitHub SSH 验证 |

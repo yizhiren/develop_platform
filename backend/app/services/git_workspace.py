@@ -8,10 +8,9 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
-
 from ..core.config import Settings
 from ..providers.git import GitProvider, GitProviderError
+from .repository_urls import validate_clone_url
 
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -378,15 +377,12 @@ class GitWorkspaceManager:
         self._lease_path(requirement_id).touch(exist_ok=True)
 
     def _validate_clone_url(self, provider: str, clone_url: str) -> None:
-        parsed = urlparse(clone_url)
-        if parsed.scheme == "file" and self.settings.allow_local_git:
-            return
-        if parsed.scheme != "https" or parsed.username or parsed.password:
-            raise GitProviderError("git.invalid_clone_url", "clone URL must be credential-free HTTPS")
-        hostname = (parsed.hostname or "").lower()
-        expected = "github.com" if provider == "github" else (urlparse(self.settings.gitlab_base_url).hostname or "").lower()
-        if hostname != expected:
-            raise GitProviderError("git.clone_host_denied", "clone host does not match provider configuration")
+        validate_clone_url(
+            provider,
+            clone_url,
+            self.settings.gitlab_base_url,
+            allow_local_git=self.settings.allow_local_git,
+        )
 
     def _git_env(self, provider: str) -> dict[str, str]:
         env = {
@@ -394,6 +390,7 @@ class GitWorkspaceManager:
             "HOME": "/tmp/forgeflow-git-home",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
         }
         token = self.settings.github_token if provider == "github" else self.settings.gitlab_token
         if token:

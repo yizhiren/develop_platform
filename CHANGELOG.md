@@ -6,6 +6,7 @@
 - 登录页与工作台侧栏采用木质画架透明 PNG 品牌 Logo，并保留原始手绘质感。
 - Agent1 至 Agent4 支持分别配置 Provider、Base URL、模型和 API Key，并支持共享 DeepSeek 配置回退。
 - 多角色 Key 在 Worker 启动时转为一次性文件并从 PID 1 环境移除。
+- Git 仓库 clone/fetch/push 统一由 Git Worker 执行；支持主机 SSH 只读挂载与主机可见工作区。
 
 ## 2026-08-05
 

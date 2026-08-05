@@ -22,7 +22,7 @@ flowchart LR
   E --> R[Architect Review]
 ```
 
-- clone URL 必须是不带凭据的 HTTPS，且主机必须匹配 Provider；`file://` 只在显式测试开关下允许。
+- clone URL 必须是不带凭据的 HTTPS 或 SSH，且主机必须匹配 Provider；SSH 用户固定为 `git`，`file://` 只在显式测试开关下允许。主机工作区与 SSH 挂载细节由 ADR-0011 补充。
 - Agent 看不到 Git Token，不能访问 `.git`，不能运行 Git、Shell 或依赖安装命令。
 - Git Worker 关闭 hooks，以临时进程环境注入认证 Header，不把凭据写进 remote URL 或仓库配置。
 - 模型每轮只产生一个符合 Schema 的动作；服务端决定动作是否执行。
