@@ -1,0 +1,16 @@
+.git
+.env
+.env.local
+node_modules
+.next
+.vinext
+dist
+.wrangler
+data
+artifacts
+*.db
+*.db-wal
+*.db-shm
+__pycache__
+.pytest_cache
+docs

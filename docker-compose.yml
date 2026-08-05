@@ -1,0 +1,235 @@
+name: forgeflow
+
+x-control-env: &control-env
+  APP_ENV: ${APP_ENV:-development}
+  APP_SECRET: ${APP_SECRET:-development-only-change-me-32-chars}
+  REDIS_URL: redis://redis:6379/0
+  WEB_ORIGIN: http://localhost:3000
+
+services:
+  storage-init:
+    image: redis:7.4-alpine
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:10001 /data /artifacts /backups /workspaces /runtime"]
+    restart: "no"
+    volumes:
+      - sqlite-data:/data
+      - artifacts:/artifacts
+      - backups:/backups
+      - workspaces:/workspaces
+      - sandbox-runtime:/runtime
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *control-env
+      DATABASE_PATH: /data/forgeflow.db
+      ARTIFACT_ROOT: /artifacts
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@example.com}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-change-this-password}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+    volumes:
+      - sqlite-data:/data
+      - artifacts:/artifacts
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    entrypoint: ["/srv/agent-entrypoint.sh"]
+    command: ["python", "-m", "app.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+      WORKSPACE_ROOT: /workspaces
+      SANDBOX_EXECUTOR_SOCKET: /runtime/sandbox.sock
+      MAX_PARALLEL_REQUIREMENTS: ${MAX_PARALLEL_REQUIREMENTS:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+      sandbox-executor:
+        condition: service_started
+    read_only: true
+    volumes:
+      - workspaces:/workspaces
+      - sandbox-runtime:/runtime
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  sandbox-executor:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.sandbox_executor"]
+    network_mode: "none"
+    environment:
+      WORKSPACE_ROOT: /workspaces
+      SANDBOX_EXECUTOR_SOCKET: /runtime/sandbox.sock
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    read_only: true
+    volumes:
+      - workspaces:/workspaces
+      - sandbox-runtime:/runtime
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  git-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.git_worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.com}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+      WORKSPACE_ROOT: /workspaces
+      ALLOW_LOCAL_GIT: ${ALLOW_LOCAL_GIT:-0}
+      MAX_PARALLEL_REQUIREMENTS: ${MAX_PARALLEL_REQUIREMENTS:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    volumes:
+      - workspaces:/workspaces
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+  backup:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.backup"]
+    environment:
+      DATABASE_PATH: /data/forgeflow.db
+    volumes:
+      - sqlite-data:/data:ro
+      - backups:/backups
+    profiles: ["tools"]
+
+  workspace-cleanup:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.workspace_cleanup"]
+    environment:
+      WORKSPACE_ROOT: /workspaces
+      WORKSPACE_TTL_HOURS: ${WORKSPACE_TTL_HOURS:-72}
+    volumes:
+      - workspaces:/workspaces
+    profiles: ["tools"]
+
+  restore-verify:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.restore_verify"]
+    volumes:
+      - backups:/backups:ro
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    profiles: ["tools"]
+
+  recovery-drill:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.recovery_drill"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["tools"]
+
+  lease-drill:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.lease_drill"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles: ["tools"]
+
+volumes:
+  sqlite-data:
+  redis-data:
+  artifacts:
+  backups:
+  workspaces:
+  sandbox-runtime:
