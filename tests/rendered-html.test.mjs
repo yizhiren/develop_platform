@@ -20,7 +20,7 @@ test("server-renders the 画板 application shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>画板 · AI 开发平台<\/title>/i);
   assert.match(html, /让每个需求/);
-  assert.match(html, /需求澄清者/);
+  assert.match(html, /需求澄清师/);
   assert.match(html, /系统架构师/);
   assert.match(html, /开发工程师/);
   assert.match(html, /验收工程师/);
@@ -30,14 +30,90 @@ test("server-renders the 画板 application shell", async () => {
 });
 
 test("keeps the product metadata and security copy", async () => {
-  const [page, layout, packageJson, logo] = await Promise.all([
+  const [page, layout, styles, packageJson, logo] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../public/huaban-logo.png", import.meta.url)),
   ]);
   assert.match(page, /Agent 沙箱/);
   assert.match(page, /发布需求/);
+  assert.match(page, /粘贴截图/);
+  assert.match(page, /onPaste=\{pasteImages\}/);
+  assert.match(page, /data_base64: attachment\.data_base64/);
+  assert.match(page, /\/api\/v1\/requirement-attachments\/\$\{attachment\.id\}\/content/);
+  assert.match(page, /添加仓库/);
+  assert.match(page, /平台设置/);
+  assert.match(page, /Provider 凭据/);
+  assert.match(page, /Token 只保存到受限 Secret Volume/);
+  assert.match(page, /\/api\/v1\/admin\/provider-credentials/);
+  assert.match(page, /type="password"/);
+  assert.match(page, /保存后不会再次显示/);
+  assert.match(page, /编辑代码仓库/);
+  assert.match(page, /保存仓库修改/);
+  assert.match(page, /method: repository \? "PUT" : "POST"/);
+  assert.match(page, /请先为.*添加仓库/);
+  assert.match(page, /仓库只会出现在当前项目中/);
+  assert.match(page, /git@github\.com:organization\/repository\.git/);
+  assert.match(page, /与需求澄清师对话/);
+  assert.match(page, /需要你回答的问题/);
+  assert.match(page, /发送回答给需求澄清师/);
+  assert.match(page, /COLLABORATION SWIMLANE/);
+  assert.match(page, /角色协作与任务交接/);
+  assert.match(page, /需求方/);
+  assert.match(page, /画板 \/ Git/);
+  assert.match(page, /handoffLabel/);
+  assert.match(page, /Code Review 意见 · 返工/);
+  assert.match(page, /workflowRunOutcomeLabels/);
+  assert.match(page, /代码评审 · 未通过/);
+  assert.match(page, /entry\.actor_id === run\.id/);
+  assert.match(page, /workflowTaskLabels/);
+  assert.match(page, /task\.agent_run_id === null/);
+  assert.match(page, /画板 \/ Git 正在执行/);
+  assert.match(page, /\/api\/v1\/requirements\/\$\{item\.id\}\/tasks/);
+  assert.match(page, /完整审计日志/);
+  assert.match(page, /aria-label="需求协作泳道图"/);
+  assert.match(page, /SWIMLANE_REFRESH_INTERVAL_MS = 1500/);
+  assert.match(page, /refreshSwimlane/);
+  assert.match(page, /运行期间每 1\.5 秒自动刷新/);
+  assert.match(page, /className="swimlane-error"/);
+  assert.match(styles, /\.workflow-swimlane/);
+  assert.match(styles, /grid-template-columns: repeat\(6/);
+  assert.match(styles, /\.swimlane-scroll[\s\S]*overflow-x: auto/);
+  assert.match(styles, /width: min\(1180px, 96vw\)/);
+  assert.match(styles, /\.swimlane-error code[\s\S]*max-height: 150px/);
+  assert.match(styles, /\.run-state\.running/);
+  assert.match(styles, /\.swimlane-event\.rejected/);
+  assert.match(styles, /\.requirement-image-previews/);
+  assert.match(styles, /\.requirement-attachment-grid/);
+  assert.match(page, /open_questions/);
+  assert.match(page, /澄清已完成，正在启动系统架构师/);
+  assert.doesNotMatch(page, />确认需求规格</);
+  assert.match(page, /实现方案评审/);
+  assert.match(page, /批准方案并开始开发/);
+  assert.match(page, /要求系统架构师调整/);
+  assert.match(page, /目标方案/);
+  assert.match(page, /回滚方案/);
+  assert.match(page, /阻塞原因/);
+  assert.match(page, /完整错误详情/);
+  assert.match(page, /开发工程师未能在步骤上限内完成/);
+  assert.match(page, /开发工程师连续返回了不可执行的动作/);
+  assert.match(page, /从开发重试，复用当前开发分支/);
+  assert.match(page, /run\.error_message/);
+  assert.match(page, /timeline-reason/);
+  assert.match(page, /分支已推送，由画板创建 PR/);
+  assert.match(page, /由画板创建 PR/);
+  assert.match(page, /git\.create_pull_request|\/pull-request/);
+  assert.match(page, /Git Worker 创建 PR 失败/);
+  assert.match(page, /手工方式（备用）/);
+  assert.match(page, /登记 PR/);
+  assert.match(page, /PR 已登记，自动合并凭据尚未配置/);
+  assert.match(page, /providerCapabilities\?\.github_api_enabled/);
+  assert.match(page, /providerApiEnabled/);
+  assert.match(page, /event !== "begin_merge" \|\| canBeginMerge/);
+  assert.match(page, /payload\.error\?\.message \|\| payload\.detail/);
+  assert.doesNotMatch(page, /PR #\{link\.pull_request_number\}/);
   assert.match(layout, /lang="zh-CN"/);
   assert.match(layout, /画板/);
   assert.match(layout, /huaban-logo\.png/);

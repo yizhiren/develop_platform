@@ -68,6 +68,44 @@ def validate_clone_url(
     )
 
 
+def validate_pull_request_url(
+    provider: str,
+    full_name: str,
+    number: int,
+    pull_request_url: str,
+    gitlab_base_url: str,
+) -> None:
+    parsed = urlparse(pull_request_url)
+    expected_host = expected_provider_host(provider, gitlab_base_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or (parsed.hostname or "").lower() != expected_host
+    ):
+        raise GitProviderError("git.invalid_pull_request_url", "pull request URL does not match provider")
+    if provider == "github":
+        expected_path = f"/{full_name}/pull/{number}"
+    else:
+        base_path = urlparse(gitlab_base_url).path.rstrip("/")
+        expected_path = f"{base_path}/{full_name}/-/merge_requests/{number}"
+    if parsed.path.rstrip("/") != expected_path:
+        raise GitProviderError("git.invalid_pull_request_url", "pull request URL does not match repository and number")
+
+
+def pull_request_web_url(
+    provider: str,
+    full_name: str,
+    number: int,
+    gitlab_base_url: str,
+) -> str:
+    if provider == "github":
+        return f"https://github.com/{full_name}/pull/{number}"
+    return f"{gitlab_base_url.rstrip('/')}/{full_name}/-/merge_requests/{number}"
+
+
 def _validate_ssh_parts(
     provider: str,
     username: str,

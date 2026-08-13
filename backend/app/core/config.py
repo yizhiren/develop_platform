@@ -69,13 +69,16 @@ class Settings(BaseSettings):
 
     github_app_id: str = ""
     github_token: str = Field(default="", repr=False)
+    github_api_enabled: str = ""
     github_private_key: str = Field(default="", repr=False)
     github_webhook_secret: str = Field(default="", repr=False)
     gitlab_base_url: str = "https://gitlab.com"
     gitlab_client_id: str = ""
     gitlab_client_secret: str = Field(default="", repr=False)
     gitlab_token: str = Field(default="", repr=False)
+    gitlab_api_enabled: str = ""
     gitlab_webhook_secret: str = Field(default="", repr=False)
+    provider_secret_root: Path = Path("/provider-secrets")
 
     task_lease_seconds: int = 300
     task_max_attempts: int = 3
@@ -87,6 +90,9 @@ class Settings(BaseSettings):
     workspace_max_bytes: int = 10 * 1024**3
     workspace_ttl_hours: int = 72
     sandbox_executor_socket: Path | None = None
+    dependency_cache_root: Path = Path("/dependency-cache")
+    dependency_install_timeout_seconds: int = 900
+    dependency_install_scripts: bool = False
 
     @property
     def database_url(self) -> str:
@@ -98,13 +104,20 @@ class Settings(BaseSettings):
         if agent_key not in AGENT_KEYS:
             raise ValueError(f"unsupported agent key: {agent_key}")
         prefix = f"{agent_key}_llm_"
+        provider = getattr(self, f"{prefix}provider") or self.llm_provider
+        role_api_key = getattr(self, f"{prefix}api_key")
+        role_api_key_file = getattr(self, f"{prefix}api_key_file")
         return AgentModelConfig(
             agent_key=agent_key,
-            provider=getattr(self, f"{prefix}provider") or self.llm_provider,
+            provider=provider,
             base_url=getattr(self, f"{prefix}base_url") or self.llm_base_url,
             model=getattr(self, f"{prefix}model") or self.llm_model,
-            api_key=getattr(self, f"{prefix}api_key") or self.deepseek_api_key,
-            api_key_file=getattr(self, f"{prefix}api_key_file") or self.deepseek_api_key_file,
+            # The shared key is explicitly a DeepSeek credential. Never forward
+            # it to an OpenAI endpoint when a role-specific key is missing.
+            api_key=role_api_key or (self.deepseek_api_key if provider == "deepseek" else ""),
+            api_key_file=role_api_key_file or (
+                self.deepseek_api_key_file if provider == "deepseek" else None
+            ),
         )
 
 

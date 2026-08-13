@@ -25,8 +25,22 @@ class CommandResult:
 class WorkspaceSandbox:
     """Constrained filesystem/command surface exposed to the developer Agent."""
 
-    ALLOWED_EXECUTABLES = {"pytest", "python", "python3", "npm", "pnpm", "yarn", "go", "cargo", "make"}
-    BLOCKED_ARGUMENTS = {"install", "add", "publish", "login", "config"}
+    ALLOWED_EXECUTABLES = {"pytest", "python", "python3", "npm", "pnpm", "yarn", "npx", "node", "go", "cargo", "make"}
+    ALLOWED_NPX_TOOLS = {"tsc", "eslint", "vitest", "jest", "prettier"}
+    BLOCKED_ARGUMENTS = {
+        "install",
+        "ci",
+        "add",
+        "update",
+        "upgrade",
+        "remove",
+        "uninstall",
+        "prune",
+        "rebuild",
+        "publish",
+        "login",
+        "config",
+    }
 
     def __init__(
         self,
@@ -78,9 +92,36 @@ class WorkspaceSandbox:
         if not old:
             raise SandboxViolation("replacement source cannot be empty")
         content = self.read_file(relative)
-        if content.count(old) != 1:
-            raise SandboxViolation("replacement source must occur exactly once")
+        match_count = content.count(old)
+        if match_count == 0 and new and content.count(new) == 1:
+            # Model retries can replay a mutation after a stale observation or
+            # response timeout. An already-applied unique replacement is a
+            # successful no-op, while ambiguous state still fails below.
+            return
+        if match_count != 1:
+            raise SandboxViolation(
+                f"replacement source matched {match_count} times; it must match exactly once. "
+                "Read the latest file and include more surrounding context, or use read_lines followed by replace_lines."
+            )
         self.write_file(relative, content.replace(old, new, 1))
+
+    def replace_lines(self, relative: str, start_line: int, end_line: int, new: str) -> None:
+        content = self.read_file(relative)
+        lines = content.splitlines(keepends=True)
+        if start_line < 1 or end_line < start_line or end_line > len(lines):
+            raise SandboxViolation(
+                f"line range {start_line}-{end_line} is outside file bounds 1-{len(lines)}"
+            )
+        line_ending = "\r\n" if "\r\n" in content else "\n"
+        replacement = new
+        replaced_section_had_newline = bool(lines[end_line - 1].endswith(("\n", "\r")))
+        has_following_lines = end_line < len(lines)
+        if replacement and not replacement.endswith(("\n", "\r")) and (
+            replaced_section_had_newline or has_following_lines
+        ):
+            replacement += line_ending
+        updated = "".join(lines[: start_line - 1]) + replacement + "".join(lines[end_line:])
+        self.write_file(relative, updated)
 
     def delete_file(self, relative: str) -> None:
         path = self._path(relative)
@@ -88,11 +129,55 @@ class WorkspaceSandbox:
             raise SandboxViolation("delete target is not an allowed file")
         path.unlink()
 
+    def restore_file(self, relative: str) -> None:
+        """Restore one tracked file from the repository's current HEAD."""
+        path = self._path(relative)
+        if ".git" in path.relative_to(self.root).parts:
+            raise SandboxViolation("Git metadata is read-only to agents")
+        repository = path.parent
+        while repository != self.root.parent and not (repository / ".git").exists():
+            repository = repository.parent
+        if repository == self.root.parent or not (repository / ".git").exists():
+            raise SandboxViolation("restore target is not inside a Git repository")
+        repository_relative = path.relative_to(repository).as_posix()
+        completed = subprocess.run(
+            ["git", "restore", "--source=HEAD", "--", repository_relative],
+            cwd=repository,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HOME": "/tmp/forgeflow-agent-home",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            },
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if completed.returncode != 0 or not path.is_file():
+            detail = (completed.stdout + completed.stderr).strip()
+            raise SandboxViolation(
+                "restore target is not a tracked file in the current HEAD"
+                + (f": {detail[:500]}" if detail else "")
+            )
+
     def run(self, argv: list[str], cwd: str = ".", timeout: int = 300) -> CommandResult:
-        if not argv or Path(argv[0]).name not in self.ALLOWED_EXECUTABLES:
+        executable = Path(argv[0]).name if argv else ""
+        if not argv or executable not in self.ALLOWED_EXECUTABLES:
             raise SandboxViolation("command is not allowlisted")
+        if executable == "node" and (len(argv) < 2 or argv[1] != "--test"):
+            raise SandboxViolation(
+                "node is allowed only as the built-in test runner (`node --test ...`); "
+                "use an existing npm/pnpm/yarn script for other repository commands"
+            )
         if any(argument.lower() in self.BLOCKED_ARGUMENTS for argument in argv[1:3]):
             raise SandboxViolation("dependency or registry mutation is not allowed")
+        if executable == "npx":
+            tool = next((item for item in argv[1:] if not item.startswith("-")), "")
+            if tool not in self.ALLOWED_NPX_TOOLS or "@" in tool:
+                raise SandboxViolation("npx tool is not allowlisted")
+            if "--no-install" not in argv[1:]:
+                argv = [argv[0], "--no-install", *argv[1:]]
         working_directory = self._path(cwd)
         if not working_directory.is_dir():
             raise SandboxViolation("command working directory is invalid")
@@ -115,7 +200,7 @@ class WorkspaceSandbox:
                 errors="replace",
                 timeout=min(max(timeout, 1), 900),
                 check=False,
-                preexec_fn=_limit_process,
+                preexec_fn=lambda: _limit_process(_command_file_size_limit(argv)),
             )
         except subprocess.TimeoutExpired as exc:
             raise SandboxViolation(f"command timed out after {exc.timeout} seconds") from exc
@@ -123,7 +208,13 @@ class WorkspaceSandbox:
         encoded = output.encode(errors="replace")
         truncated = len(encoded) > self.max_output_bytes
         if truncated:
-            output = encoded[: self.max_output_bytes].decode(errors="replace") + "\n[output truncated]"
+            head_bytes = self.max_output_bytes // 2
+            tail_bytes = self.max_output_bytes - head_bytes
+            output = (
+                encoded[:head_bytes].decode(errors="replace")
+                + "\n[output truncated; final output follows]\n"
+                + encoded[-tail_bytes:].decode(errors="replace")
+            )
         return CommandResult(argv=argv, returncode=completed.returncode, output=output, truncated=truncated)
 
     def _run_remote(self, argv: list[str], cwd: str, timeout: int) -> CommandResult:
@@ -173,8 +264,22 @@ class WorkspaceSandbox:
         return candidate
 
 
-def _limit_process() -> None:
+def _command_file_size_limit(argv: list[str]) -> int:
+    """Allow bounded build artifacts while keeping ordinary commands tighter."""
+    if not argv:
+        return 64 * 1024**2
+    executable = Path(argv[0]).name
+    lowered = [item.lower() for item in argv[1:4]]
+    artifact_markers = ("build", "package", "bundle", "dist", "release")
+    if executable in {"npm", "pnpm", "yarn", "make", "cargo", "go"} and any(
+        item.startswith(artifact_markers) for item in lowered
+    ):
+        return 512 * 1024**2
+    return 64 * 1024**2
+
+
+def _limit_process(max_file_size: int = 64 * 1024**2) -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
     resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_size, max_file_size))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))

@@ -1,9 +1,10 @@
 from pathlib import Path
+import subprocess
 import threading
 
 import pytest
 
-from app.agents.sandbox import SandboxViolation, WorkspaceSandbox
+from app.agents.sandbox import SandboxViolation, WorkspaceSandbox, _command_file_size_limit
 from app.core.config import Settings
 from app.sandbox_executor import SandboxRequestHandler, ThreadingUnixServer
 
@@ -18,12 +19,100 @@ def test_workspace_sandbox_reads_writes_and_runs_allowlisted_command(tmp_path: P
     assert result.output.strip() == "ok"
 
 
+def test_workspace_sandbox_replace_text_is_idempotent_when_new_text_already_exists(tmp_path: Path) -> None:
+    target = tmp_path / "value.txt"
+    target.write_text("before\nupdated\nafter\n")
+    sandbox = WorkspaceSandbox(tmp_path)
+
+    sandbox.replace_text("value.txt", "old value", "updated")
+
+    assert target.read_text() == "before\nupdated\nafter\n"
+
+
 def test_workspace_sandbox_blocks_escape_and_package_install(tmp_path: Path) -> None:
     sandbox = WorkspaceSandbox(tmp_path)
     with pytest.raises(SandboxViolation, match="escapes"):
         sandbox.read_file("../secret")
     with pytest.raises(SandboxViolation, match="not allowed"):
         sandbox.run(["npm", "install"])
+    with pytest.raises(SandboxViolation, match="not allowed"):
+        sandbox.run(["npm", "ci"])
+    with pytest.raises(SandboxViolation, match="not allowed"):
+        sandbox.run(["pnpm", "prune"])
+    with pytest.raises(SandboxViolation, match="npx tool is not allowlisted"):
+        sandbox.run(["npx", "create-react-app", "demo"])
+
+
+def test_workspace_sandbox_forces_local_only_npx_validation(monkeypatch, tmp_path: Path) -> None:
+    sandbox = WorkspaceSandbox(tmp_path)
+    observed: dict[str, list[str]] = {}
+
+    def fake_run(argv, **_kwargs):
+        observed["argv"] = argv
+
+        class Result:
+            stdout = "ok"
+            stderr = ""
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("app.agents.sandbox.subprocess.run", fake_run)
+
+    result = sandbox.run(["npx", "tsc", "--noEmit"])
+
+    assert observed["argv"] == ["npx", "--no-install", "tsc", "--noEmit"]
+    assert result.returncode == 0
+
+
+def test_workspace_sandbox_allows_only_node_builtin_test_runner(monkeypatch, tmp_path: Path) -> None:
+    sandbox = WorkspaceSandbox(tmp_path)
+    observed: dict[str, list[str]] = {}
+
+    def fake_run(argv, **_kwargs):
+        observed["argv"] = argv
+
+        class Result:
+            stdout = "ok"
+            stderr = ""
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("app.agents.sandbox.subprocess.run", fake_run)
+
+    result = sandbox.run(["node", "--test", "tests/value.test.js"])
+
+    assert observed["argv"] == ["node", "--test", "tests/value.test.js"]
+    assert result.returncode == 0
+    with pytest.raises(SandboxViolation, match="only as the built-in test runner"):
+        sandbox.run(["node", "scripts/arbitrary.js"])
+
+
+def test_workspace_sandbox_restores_one_tracked_file_from_head(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+    tracked = repository / "tracked.txt"
+    tracked.write_text("original\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=repository, check=True, capture_output=True)
+    tracked.unlink()
+
+    sandbox = WorkspaceSandbox(tmp_path)
+    sandbox.restore_file("repo/tracked.txt")
+
+    assert tracked.read_text() == "original\n"
+    with pytest.raises(SandboxViolation, match="not a tracked file"):
+        sandbox.restore_file("repo/untracked.txt")
+
+
+def test_sandbox_uses_larger_bounded_file_limit_only_for_build_artifact_commands() -> None:
+    assert _command_file_size_limit(["npm", "run", "package:cli"]) == 512 * 1024**2
+    assert _command_file_size_limit(["npm", "test"]) == 64 * 1024**2
+    assert _command_file_size_limit(["python", "-m", "pytest"]) == 64 * 1024**2
 
 
 def test_workspace_sandbox_dispatches_command_over_unix_socket(monkeypatch, tmp_path: Path) -> None:

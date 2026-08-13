@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
 
 
 class ORMModel(BaseModel):
@@ -69,6 +69,10 @@ class RepositoryCreate(BaseModel):
     default_branch: str = "main"
 
 
+class RepositoryUpdate(RepositoryCreate):
+    pass
+
+
 class RepositoryView(ORMModel):
     id: str
     project_id: str
@@ -81,10 +85,26 @@ class RepositoryView(ORMModel):
     webhook_status: str
 
 
+class ProviderCredentialUpdate(BaseModel):
+    token: SecretStr = Field(min_length=20, max_length=4096)
+
+
+class ProviderCredentialStatus(BaseModel):
+    provider: Literal["github", "gitlab"]
+    configured: bool
+    source: Literal["managed", "environment", "none"]
+
+
 class RequirementRepositoryInput(BaseModel):
     repository_id: str
     target_branch: str
     merge_order: int = Field(default=0, ge=0)
+
+
+class RequirementImageInput(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    media_type: Literal["image/png", "image/jpeg", "image/webp"]
+    data_base64: str = Field(min_length=4, max_length=7_000_000)
 
 
 class RequirementCreate(BaseModel):
@@ -92,6 +112,7 @@ class RequirementCreate(BaseModel):
     description: str = Field(min_length=10, max_length=50_000)
     priority: Literal["low", "medium", "high", "critical"] = "medium"
     repositories: list[RequirementRepositoryInput] = Field(min_length=1)
+    attachments: list[RequirementImageInput] = Field(default_factory=list, max_length=5)
 
 
 class RequirementView(ORMModel):
@@ -108,6 +129,16 @@ class RequirementView(ORMModel):
     acceptance_failures: int
     created_at: datetime
     updated_at: datetime
+
+
+class RequirementAttachmentView(ORMModel):
+    id: str
+    requirement_id: str
+    filename: str
+    media_type: str
+    sha256: str
+    size_bytes: int
+    created_at: datetime
 
 
 class RequirementRepositoryView(ORMModel):
@@ -155,9 +186,9 @@ class TransitionView(BaseModel):
 
 
 class AcceptanceCriterion(BaseModel):
-    id: str
-    description: str
-    verification_method: str
+    id: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=4000)
+    verification_method: str = Field(min_length=1, max_length=4000)
     priority: Literal["must", "should", "could"] = "must"
 
 
@@ -167,7 +198,7 @@ class ClarificationSpec(BaseModel):
     users_and_scenarios: list[str]
     functional_requirements: list[str]
     non_functional_requirements: list[str]
-    acceptance_criteria: list[AcceptanceCriterion]
+    acceptance_criteria: list[AcceptanceCriterion] = Field(min_length=1, max_length=100)
     edge_cases: list[str]
     out_of_scope: list[str]
     dependencies: list[str]
@@ -206,6 +237,7 @@ class DevelopmentReport(BaseModel):
     commits: dict[str, list[str]]
     tests: list[dict[str, Any]]
     unresolved_risks: list[str]
+    files_changed: list[str] = Field(default_factory=list)
 
 
 class ReviewFinding(BaseModel):

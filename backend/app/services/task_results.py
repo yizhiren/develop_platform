@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from ..core.config import get_settings
 from ..models.entities import AgentRun, ArtifactVersion, Evidence, MergeAttempt, OutboxEvent, Requirement, RequirementRepository, WorkflowTask
 from .artifacts import ArtifactStore
+from .diagnostics import safe_error_message
 from .workflow import transition_requirement
 
 
@@ -18,7 +19,14 @@ TASK_EVENTS = {
     "agent.revise": "revision_ready",
     "agent.final_accept": "final_acceptance_passed",
     "git.prepare_workspaces": "workspace_ready",
+    "git.restore_workspaces": "workspace_restored",
+    "git.restore_validation_workspace": "validation_workspace_restored",
+    "dependency.prepare": "dependencies_ready",
+    "dependency.prepare_verification": "verification_dependencies_ready",
+    "dependency.prepare_incremental_verification": "incremental_verification_dependencies_ready",
+    "dependency.prepare_final_verification": "final_verification_dependencies_ready",
     "git.prepare_analysis": "analysis_ready",
+    "git.commit_changes": "changes_committed",
     "git.publish_changes": "changes_published",
     "git.prepare_verification": "verification_ready",
     "git.prepare_final_verification": "final_verification_ready",
@@ -34,8 +42,16 @@ ARTIFACT_KINDS = {
     "agent.revise": "architecture_revision",
     "agent.final_accept": "final_acceptance_report",
     "git.prepare_workspaces": "workspace_manifest",
+    "git.restore_workspaces": "workspace_manifest",
+    "git.restore_validation_workspace": "workspace_manifest",
+    "dependency.prepare": "dependency_manifest",
+    "dependency.prepare_verification": "verification_dependency_manifest",
+    "dependency.prepare_incremental_verification": "incremental_verification_dependency_manifest",
+    "dependency.prepare_final_verification": "final_verification_dependency_manifest",
     "git.prepare_analysis": "repository_analysis",
+    "git.commit_changes": "development_commit_manifest",
     "git.publish_changes": "delivery_manifest",
+    "git.create_pull_request": "pull_request_manifest",
     "git.prepare_verification": "verification_manifest",
     "git.prepare_final_verification": "final_verification_manifest",
     "git.prepare_incremental_verification": "incremental_verification_manifest",
@@ -45,15 +61,40 @@ ARTIFACT_KINDS = {
 
 def process_task_result(session: Session, result: dict[str, Any]) -> None:
     task = session.get(WorkflowTask, result["task_id"])
-    if task is None or task.status in {"completed", "failed"}:
+    # Workers can finish after a requester closes the requirement. Only active
+    # tasks may mutate artifacts or advance the workflow; late results are inert.
+    if task is None or task.status not in {"queued", "running"}:
         return
     run = session.get(AgentRun, task.agent_run_id) if task.agent_run_id else None
-    if result.get("status") != "completed":
+    result_status = str(result.get("status", "failed"))
+    if result_status == "running":
+        _mark_task_running(task, run, result)
+        return
+    if result_status != "completed":
         task.status = "failed"
+        task.lease_owner = None
+        task.lease_expires_at = None
         task.attempt_count += 1
+        payload = json.loads(task.payload_json)
+        payload["_failure"] = {
+            "error_code": str(result.get("error_code", "worker.failed"))[:80],
+            "error_message": safe_error_message(result.get("error_message", ""), 3_800),
+            "changed_paths": [
+                str(path)[:1_000]
+                for path in result.get("changed_paths", [])[:200]
+                if isinstance(path, str)
+            ]
+            if isinstance(result.get("changed_paths"), list)
+            else [],
+        }
+        task.payload_json = json.dumps(payload, ensure_ascii=False)
         if run:
             run.status = "failed"
+            if result.get("model"):
+                run.model = str(result["model"])[:120]
             run.error_code = result.get("error_code", "worker.failed")
+            run.error_message = _failure_reason(result)
+            run.token_usage = int(result.get("token_usage", 0))
             run.completed_at = datetime.now(UTC)
         if result.get("retryable") and task.attempt_count < get_settings().task_max_attempts:
             _schedule_retry(session, task, run)
@@ -68,11 +109,41 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
                 attempt.completed_at = datetime.now(UTC)
             requirement = session.get(Requirement, task.requirement_id)
             if requirement:
-                transition_requirement(session, requirement, "merge_failed", requirement.version, "worker", None, str(result.get("error_code", "git.failed")))
-        elif task.task_type in {"git.prepare_workspaces", "git.publish_changes"}:
+                transition_requirement(session, requirement, "merge_failed", requirement.version, "worker", None, _failure_reason(result))
+        elif task.task_type.startswith("dependency.prepare"):
             requirement = session.get(Requirement, task.requirement_id)
             if requirement:
-                transition_requirement(session, requirement, "automation_failed", requirement.version, "git_worker", None, str(result.get("error_code", "git.failed")))
+                transition_requirement(
+                    session,
+                    requirement,
+                    "dependency_failed",
+                    requirement.version,
+                    "dependency_worker",
+                    None,
+                    _failure_reason(result),
+                )
+        elif task.task_type in {
+            "git.prepare_workspaces",
+            "git.restore_workspaces",
+            "git.restore_validation_workspace",
+            "git.commit_changes",
+            "git.publish_changes",
+        }:
+            requirement = session.get(Requirement, task.requirement_id)
+            if requirement:
+                transition_requirement(
+                    session,
+                    requirement,
+                    "automation_failed",
+                    requirement.version,
+                    "git_worker",
+                    None,
+                    _failure_reason(result),
+                )
+        elif task.task_type == "git.create_pull_request":
+            # Stay at the merge gate so the owner can retry or use the
+            # validated manual registration fallback.
+            return
         elif task.task_type in {
             "git.prepare_analysis",
             "git.prepare_verification",
@@ -81,18 +152,24 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
         }:
             requirement = session.get(Requirement, task.requirement_id)
             if requirement:
-                transition_requirement(session, requirement, "technical_failure", requirement.version, "git_worker", None, str(result.get("error_code", "git.failed")))
+                transition_requirement(session, requirement, "technical_failure", requirement.version, "git_worker", None, _failure_reason(result))
         elif task.task_type.startswith("agent."):
             requirement = session.get(Requirement, task.requirement_id)
             if requirement:
-                transition_requirement(session, requirement, "technical_failure", requirement.version, "worker", None, str(result.get("error_code", "agent.failed")))
+                transition_requirement(session, requirement, "technical_failure", requirement.version, "worker", None, _failure_reason(result))
         return
 
     output = dict(result.get("output") or {})
+    if task.task_type in {"agent.accept", "agent.final_accept", "agent.regression"}:
+        _enforce_acceptance_evidence_gate(task, output)
     _externalize_large_evidence(session, task, output)
     task.status = "completed"
+    task.lease_owner = None
+    task.lease_expires_at = None
     if run:
         run.status = "completed"
+        if result.get("model"):
+            run.model = str(result["model"])[:120]
         run.output_json = json.dumps(output, ensure_ascii=False)
         run.token_usage = int(result.get("token_usage", 0))
         run.completed_at = datetime.now(UTC)
@@ -116,15 +193,23 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
             transition_requirement(session, requirement, event, requirement.version, "git_worker", None, str(output.get("merged_sha", "")))
         return
 
-    if task.task_type == "git.publish_changes":
+    if task.task_type in {"git.commit_changes", "git.publish_changes"}:
         for item in output.get("repositories", []):
             link = session.get(RequirementRepository, item.get("requirement_repository_id"))
             if link and link.requirement_id == task.requirement_id:
                 link.work_branch = item.get("work_branch")
-                link.pull_request_number = item.get("pull_request_number")
-                link.pull_request_url = item.get("pull_request_url")
+                if task.task_type == "git.publish_changes":
+                    link.pull_request_number = item.get("pull_request_number")
+                    link.pull_request_url = item.get("pull_request_url")
                 link.head_sha = item.get("head_sha")
-                link.status = "ready"
+                link.status = "ready" if task.task_type == "git.publish_changes" else "committed"
+    elif task.task_type == "git.create_pull_request":
+        link = session.get(RequirementRepository, output.get("requirement_repository_id"))
+        if link and link.requirement_id == task.requirement_id:
+            if str(output.get("head_sha", "")).lower() != (link.head_sha or "").lower():
+                raise ValueError("pull request result head SHA does not match reviewed delivery")
+            link.pull_request_number = int(output["pull_request_number"])
+            link.pull_request_url = str(output["pull_request_url"])
 
     max_version = session.scalar(
         select(func.max(ArtifactVersion.version)).where(
@@ -145,8 +230,20 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
     requirement = session.get(Requirement, task.requirement_id)
     if requirement is None:
         return
-    if task.task_type == "agent.review":
+    if task.task_type == "agent.clarify":
+        event = "clarification_ready" if output.get("open_questions") else "clarification_complete"
+    elif task.task_type == "agent.review":
         event = "review_approved" if output.get("approved") else "review_rejected"
+    elif task.task_type == "agent.develop" and not output.get("repositories_changed"):
+        prior_commit = session.scalar(
+            select(ArtifactVersion.id)
+            .where(
+                ArtifactVersion.requirement_id == task.requirement_id,
+                ArtifactVersion.kind == "development_commit_manifest",
+            )
+            .limit(1)
+        )
+        event = "development_evidence_ready" if prior_commit else TASK_EVENTS.get(task.task_type)
     elif task.task_type == "agent.accept":
         event = "acceptance_approved" if output.get("approved") else "acceptance_rejected"
     elif task.task_type == "agent.final_accept":
@@ -156,6 +253,12 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
     else:
         event = TASK_EVENTS.get(task.task_type)
     if event:
+        task_context: dict[str, Any] | None = None
+        if task.task_type == "dependency.prepare":
+            payload = json.loads(task.payload_json)
+            previous_failure = payload.get("context", {}).get("_previous_attempt_failure")
+            if isinstance(previous_failure, dict):
+                task_context = {"_previous_attempt_failure": previous_failure}
         transition_requirement(
             session,
             requirement,
@@ -164,7 +267,26 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
             actor_type="agent",
             actor_id=task.agent_run_id,
             reason=str(output.get("summary", "")),
+            task_context=task_context,
         )
+
+
+def _mark_task_running(
+    task: WorkflowTask,
+    run: AgentRun | None,
+    result: dict[str, Any],
+) -> None:
+    try:
+        lease_seconds = int(result.get("lease_seconds", 30))
+    except (TypeError, ValueError):
+        lease_seconds = 30
+    lease_seconds = min(max(lease_seconds, 30), 24 * 3600)
+    worker_id = str(result.get("worker_id", "")).strip()[:120]
+    task.status = "running"
+    task.lease_owner = worker_id or None
+    task.lease_expires_at = datetime.now(UTC) + timedelta(seconds=lease_seconds)
+    if run and run.status in {"queued", "running"}:
+        run.status = "running"
 
 
 def _to_markdown(value: Any, level: int = 1) -> str:
@@ -180,12 +302,122 @@ def _to_markdown(value: Any, level: int = 1) -> str:
     return str(value)
 
 
+def _failure_reason(result: dict[str, Any]) -> str:
+    code = str(result.get("error_code", "worker.failed")).strip()[:80]
+    message = safe_error_message(result.get("error_message", ""), 3_800)
+    return f"{code}: {message}" if message and message != code else code
+
+
+def _enforce_acceptance_evidence_gate(task: WorkflowTask, output: dict[str, Any]) -> None:
+    """Reject unsupported Agent4 approvals before they can advance the workflow."""
+    payload = json.loads(task.payload_json)
+    context = payload.get("context", {})
+    artifacts = context.get("artifacts", {})
+    manifest_key = {
+        "agent.accept": "verification_manifest",
+        "agent.final_accept": "final_verification_manifest",
+        "agent.regression": "incremental_verification_manifest",
+    }[task.task_type]
+    if not artifacts.get(manifest_key):
+        # Legacy/Fake flows without repository automation retain the protocol-only behavior.
+        return
+
+    clarification = artifacts.get("clarification_spec", {})
+    expected = clarification.get("acceptance_criteria", []) if isinstance(clarification, dict) else []
+    expected = [item for item in expected if isinstance(item, dict)]
+    expected_ids = [str(item.get("id", "")).strip() for item in expected]
+    priorities = {
+        str(item.get("id", "")).strip(): str(item.get("priority", "must"))
+        for item in expected
+    }
+    results = output.get("criteria", [])
+    results = [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
+    result_ids = [str(item.get("criterion_id", "")).strip() for item in results]
+    raw_evidence = output.get("regression_results", [])
+    evidence = [item for item in raw_evidence if isinstance(item, dict)] if isinstance(raw_evidence, list) else []
+    evidence_by_id = {
+        str(item.get("evidence_id")): item
+        for item in evidence
+        if item.get("evidence_id")
+    }
+
+    issues: list[str] = []
+    if not expected_ids or any(not item for item in expected_ids) or len(set(expected_ids)) != len(expected_ids):
+        issues.append("confirmed acceptance criteria are missing or have invalid ids")
+    if len(result_ids) != len(set(result_ids)) or set(result_ids) != set(expected_ids):
+        issues.append(
+            f"acceptance report must exactly cover confirmed criteria; expected={expected_ids}, actual={result_ids}"
+        )
+    for item in results:
+        criterion_id = str(item.get("criterion_id", "")).strip()
+        if item.get("status") != "passed" or criterion_id not in priorities:
+            continue
+        evidence_paths = [str(value) for value in item.get("evidence_paths", [])]
+        unknown_evidence = [value for value in evidence_paths if value not in evidence_by_id]
+        if unknown_evidence:
+            issues.append(f"{criterion_id} references unknown evidence ids: {unknown_evidence}")
+        linked = [evidence_by_id.get(value) for value in evidence_paths]
+        direct = [
+            value
+            for value in linked
+            if value
+            and criterion_id in value.get("criterion_ids", [])
+            and value.get("status") == "passed"
+        ]
+        if not direct:
+            issues.append(f"{criterion_id} is passed without directly linked passing evidence")
+
+    if output.get("approved"):
+        independent_commands = [
+            item
+            for item in evidence
+            if item.get("source") == "agent4_independent"
+            and item.get("type") == "command"
+            and item.get("status") == "passed"
+        ]
+        if not independent_commands:
+            issues.append("approval requires at least one successful independent Agent4 command")
+        failed_commands = [
+            item
+            for item in evidence
+            if item.get("type") == "command" and item.get("status") != "passed"
+        ]
+        if failed_commands:
+            issues.append("approval contains failed replay or independent commands")
+        if any(item.get("workspace_integrity_violations") for item in evidence):
+            issues.append("approval contains workspace integrity violations")
+        failed_must = [
+            item.get("criterion_id")
+            for item in results
+            if priorities.get(str(item.get("criterion_id", ""))) == "must"
+            and item.get("status") != "passed"
+        ]
+        if failed_must:
+            issues.append(f"must criteria are not passed: {failed_must}")
+
+    evidence.append(
+        {
+            "evidence_id": "platform-acceptance-gate",
+            "source": "platform_gate",
+            "type": "acceptance_coverage",
+            "status": "failed" if issues else "passed",
+            "issues": issues,
+        }
+    )
+    output["regression_results"] = evidence
+    if issues:
+        output["approved"] = False
+        detail = "; ".join(issues)
+        original = str(output.get("summary", "")).strip()
+        output["summary"] = f"平台验收证据门禁未通过：{detail}。{original}".strip()
+
+
 def _externalize_large_evidence(
     session: Session,
     task: WorkflowTask,
     output: dict[str, Any],
 ) -> None:
-    if task.task_type != "git.publish_changes":
+    if task.task_type not in {"git.commit_changes", "git.publish_changes"}:
         return
     combined_diff = output.get("combined_diff")
     if not isinstance(combined_diff, str):
@@ -216,6 +448,11 @@ def _externalize_large_evidence(
 
 def _schedule_retry(session: Session, task: WorkflowTask, run: AgentRun | None) -> WorkflowTask:
     payload = json.loads(task.payload_json)
+    if isinstance(payload.get("context"), dict) and isinstance(payload.get("_failure"), dict):
+        payload["context"] = {
+            **payload["context"],
+            "_previous_attempt_failure": payload["_failure"],
+        }
     retry_run = None
     if run:
         retry_run = AgentRun(

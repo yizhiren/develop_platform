@@ -1,8 +1,9 @@
 import pytest
+from pydantic import ValidationError
 
 from app.agents.providers import FakeLLMProvider, LLMProvider, ModelResponse
 from app.agents.runtime import AgentRuntime
-from app.schemas.domain import ClarificationSpec, CodeReviewReport
+from app.schemas.domain import AcceptanceCriterion, ClarificationSpec, CodeReviewReport
 
 
 @pytest.mark.asyncio
@@ -12,7 +13,15 @@ async def test_fake_clarifier_is_schema_valid() -> None:
     )
     assert isinstance(output, ClarificationSpec)
     assert output.acceptance_criteria
+    assert all(item.verification_method.strip() for item in output.acceptance_criteria)
     assert response.model == "fake"
+
+    with pytest.raises(ValidationError):
+        AcceptanceCriterion(
+            id="AC-empty-method",
+            description="This criterion has no executable guidance",
+            verification_method="",
+        )
 
 
 @pytest.mark.asyncio

@@ -116,6 +116,20 @@ class Requirement(Base):
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
 
+class RequirementAttachment(Base):
+    __tablename__ = "requirement_attachments"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    requirement_id: Mapped[str] = mapped_column(
+        ForeignKey("requirements.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(String(255))
+    media_type: Mapped[str] = mapped_column(String(80))
+    path: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class RequirementRepository(Base):
     __tablename__ = "requirement_repositories"
     __table_args__ = (UniqueConstraint("requirement_id", "repository_id"),)
@@ -204,6 +218,7 @@ class AgentRun(Base):
     input_json: Mapped[str] = mapped_column(Text, default="{}")
     output_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_usage: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)

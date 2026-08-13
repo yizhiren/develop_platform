@@ -55,10 +55,27 @@ def _add_agent_identity(connection: Connection) -> None:
     )
 
 
+def _add_agent_error_message(connection: Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql("PRAGMA table_info(agent_runs)").fetchall()
+    }
+    if "error_message" not in columns:
+        connection.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN error_message TEXT")
+
+
+def _add_requirement_attachments(connection: Connection) -> None:
+    from .models.entities import RequirementAttachment
+
+    RequirementAttachment.__table__.create(connection, checkfirst=True)
+
+
 MIGRATIONS = (
     Migration(1, "initial_schema", _initial_schema),
     Migration(2, "requirement_repository_pull_request_url", _add_pull_request_url),
     Migration(3, "agent_run_stable_identity", _add_agent_identity),
+    Migration(4, "agent_run_error_message", _add_agent_error_message),
+    Migration(5, "requirement_image_attachments", _add_requirement_attachments),
 )
 
 

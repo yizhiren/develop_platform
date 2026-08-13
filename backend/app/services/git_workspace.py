@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
+import signal
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 from ..core.config import Settings
 from ..providers.git import GitProvider, GitProviderError
 from .repository_urls import validate_clone_url
@@ -66,6 +69,7 @@ class GitWorkspaceManager:
                 ["git", "clone", "--no-tags", "--single-branch", "--branch", repository["target_branch"], "--", clone_url, str(target)],
                 self.root,
                 env,
+                timeout_seconds=900,
             )
             work_branch = f"huaban/req-{requirement_id[:12]}"
             self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
@@ -96,6 +100,32 @@ class GitWorkspaceManager:
             "repositories": manifests,
         }
 
+    def restore(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Discard failed-run residue while preserving the latest local commit."""
+        manifest = context.get("artifacts", {}).get("workspace_manifest")
+        if not manifest or not manifest.get("workspace_root"):
+            raise GitProviderError("git.workspace_missing", "workspace manifest is missing")
+        root = Path(manifest["workspace_root"]).resolve()
+        if not root.is_relative_to(self.root):
+            raise GitProviderError("git.workspace_escape", "workspace is outside configured root")
+        restored: list[dict[str, Any]] = []
+        for item in manifest.get("repositories", []):
+            repository_root = (root / item["relative_path"]).resolve()
+            if not repository_root.is_relative_to(root) or not (repository_root / ".git").exists():
+                raise GitProviderError("git.workspace_missing", "repository workspace is missing")
+            env = self._git_env(item["provider"])
+            before = self._run(["git", "status", "--porcelain=v1"], repository_root, env)
+            self._run(["git", "reset", "--hard", "HEAD"], repository_root, env)
+            self._run(["git", "clean", "-fd"], repository_root, env)
+            restored.append(
+                {
+                    "repository_id": item["repository_id"],
+                    "head_sha": self._run(["git", "rev-parse", "HEAD"], repository_root, env).strip(),
+                    "discarded_entries": len([line for line in before.splitlines() if line.strip()]),
+                }
+            )
+        return {**manifest, "restored": restored}
+
     def prepare_analysis(self, context: dict[str, Any]) -> dict[str, Any]:
         requirement_id = _safe_id(context["requirement_id"])
         workspace_id = _safe_id(f"{requirement_id}-analysis")
@@ -116,6 +146,7 @@ class GitWorkspaceManager:
                     ["git", "clone", "--no-tags", "--single-branch", "--branch", repository["target_branch"], "--", clone_url, str(target)],
                     self.root,
                     env,
+                    timeout_seconds=900,
                 )
                 self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
                 head_sha = self._run(["git", "rev-parse", "HEAD"], target, env).strip()
@@ -181,9 +212,22 @@ class GitWorkspaceManager:
                 target = verification_root / repository_id
                 env = self._git_env(repository["provider"])
                 self._run(
-                    ["git", "clone", "--no-tags", "--single-branch", "--branch", branch, "--", clone_url, str(target)],
+                    [
+                        "git",
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--no-tags",
+                        "--single-branch",
+                        "--branch",
+                        branch,
+                        "--",
+                        clone_url,
+                        str(target),
+                    ],
                     self.root,
                     env,
+                    timeout_seconds=900,
                 )
                 self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
                 actual_sha = self._run(["git", "rev-parse", "HEAD"], target, env).strip()
@@ -222,8 +266,11 @@ class GitWorkspaceManager:
     async def publish(
         self,
         context: dict[str, Any],
-        provider_factory: Callable[[str], GitProvider],
+        provider_factory: Callable[[str], GitProvider | None],
     ) -> dict[str, Any]:
+        committed = context.get("artifacts", {}).get("development_commit_manifest")
+        if committed:
+            return await self._publish_committed(context, committed, provider_factory)
         manifest = context.get("artifacts", {}).get("workspace_manifest")
         if not manifest:
             raise GitProviderError("git.workspace_missing", "workspace manifest is missing")
@@ -252,6 +299,7 @@ class GitWorkspaceManager:
                     item,
                     repository_root,
                     env,
+                    _repository_changed_paths(context, item),
                 )
                 status = self._run(["git", "status", "--porcelain=v1"], trusted_root, env)
                 head_sha = self._run(["git", "rev-parse", "HEAD"], trusted_root, env).strip()
@@ -281,18 +329,7 @@ class GitWorkspaceManager:
                 # Replace all Agent-touched Git metadata with the trusted clone before any retry.
                 shutil.rmtree(repository_root)
                 shutil.move(str(trusted_root), str(repository_root))
-                provider = provider_factory(item["provider"])
-                try:
-                    pull_request = await provider.create_or_update_pull_request(
-                        item["full_name"],
-                        item["work_branch"],
-                        item["target_branch"],
-                        f"[画板] {context['title']}",
-                        _pull_request_body(context),
-                    )
-                finally:
-                    if hasattr(provider, "close"):
-                        await provider.close()  # type: ignore[attr-defined]
+                pull_request = await _create_pull_request_or_manual_link(provider_factory, item, context)
                 review_diff = self._run(
                     ["git", "diff", "--no-ext-diff", f"{item['baseline_sha']}..{head_sha}"],
                     repository_root,
@@ -311,8 +348,9 @@ class GitWorkspaceManager:
                     "work_branch": item["work_branch"],
                     "baseline_sha": item["baseline_sha"],
                     "head_sha": head_sha,
-                    "pull_request_number": pull_request.number,
-                    "pull_request_url": pull_request.url,
+                    "pull_request_number": pull_request["number"],
+                    "pull_request_url": pull_request["url"],
+                    "publication_mode": pull_request["mode"],
                 }
             )
         if not published:
@@ -324,6 +362,204 @@ class GitWorkspaceManager:
             "combined_diff": "\n\n".join(combined_diff),
         }
 
+    def commit(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Create trusted local commits from the developer worktree without pushing."""
+        manifest = context.get("artifacts", {}).get("workspace_manifest")
+        if not manifest:
+            raise GitProviderError("git.workspace_missing", "workspace manifest is missing")
+        root = Path(manifest["workspace_root"]).resolve()
+        if not root.is_relative_to(self.root):
+            raise GitProviderError("git.workspace_escape", "workspace is outside configured root")
+        requirement_id = _safe_id(context["requirement_id"])
+        self._touch_lease(requirement_id)
+        repository_context = {item["repository_id"]: item for item in context.get("repositories", [])}
+        changed_repository_ids = set(
+            context.get("artifacts", {}).get("development_report", {}).get("repositories_changed", [])
+        )
+        committed: list[dict[str, Any]] = []
+        combined_diff: list[str] = []
+        for item in manifest.get("repositories", []):
+            if changed_repository_ids and item["repository_id"] not in changed_repository_ids:
+                continue
+            repo_context = repository_context[item["repository_id"]]
+            repository_root = (root / item["relative_path"]).resolve()
+            if not repository_root.is_relative_to(root):
+                raise GitProviderError("git.workspace_escape", "repository path escapes workspace")
+            env = self._git_env(item["provider"])
+            try:
+                trusted_root = self._trusted_publish_checkout(
+                    requirement_id,
+                    repo_context,
+                    item,
+                    repository_root,
+                    env,
+                    _repository_changed_paths(context, item),
+                )
+                status = self._run(["git", "status", "--porcelain=v1"], trusted_root, env)
+                if not status.strip():
+                    shutil.rmtree(trusted_root, ignore_errors=True)
+                    continue
+                self._run(["git", "add", "-A"], trusted_root, env)
+                staged_diff = self._run(
+                    ["git", "diff", "--cached", "--no-ext-diff", "--binary"],
+                    trusted_root,
+                    env,
+                    max_bytes=2_000_000,
+                )
+                self._scan_secrets(staged_diff)
+                self._run(["git", "commit", "-m", f"feat: {context['title']}"], trusted_root, env)
+                head_sha = self._run(["git", "rev-parse", "HEAD"], trusted_root, env).strip()
+                review_diff = self._run(
+                    ["git", "diff", "--no-ext-diff", f"{item['baseline_sha']}..{head_sha}"],
+                    trusted_root,
+                    env,
+                    max_bytes=500_000,
+                )
+                changed_files = self._review_file_snapshots(
+                    trusted_root,
+                    item["baseline_sha"],
+                    head_sha,
+                    env,
+                )
+                shutil.rmtree(repository_root)
+                shutil.move(str(trusted_root), str(repository_root))
+            except Exception:
+                pending = self.publishing / requirement_id / item["repository_id"]
+                shutil.rmtree(pending, ignore_errors=True)
+                raise
+            combined_diff.append(f"## {item['full_name']}\n{review_diff}")
+            committed.append(
+                {
+                    "requirement_repository_id": item["requirement_repository_id"],
+                    "repository_id": item["repository_id"],
+                    "full_name": item["full_name"],
+                    "work_branch": item["work_branch"],
+                    "baseline_sha": item["baseline_sha"],
+                    "head_sha": head_sha,
+                    "diff_sha256": hashlib.sha256(review_diff.encode()).hexdigest(),
+                    "changed_files": changed_files,
+                }
+            )
+        if not committed:
+            raise GitProviderError("git.no_changes", "developer agent produced no repository changes")
+        self._touch_lease(requirement_id)
+        return {
+            "schema_version": "1.0",
+            "summary": "Developer changes committed locally; nothing was pushed.",
+            "push_performed": False,
+            "repositories": committed,
+            "combined_diff": "\n\n".join(combined_diff),
+        }
+
+    def _review_file_snapshots(
+        self,
+        repository_root: Path,
+        baseline_sha: str,
+        head_sha: str,
+        env: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """Capture bounded post-commit text for files changed in the reviewed SHA."""
+        names = self._run(
+            ["git", "diff", "--name-only", "--diff-filter=ACMR", f"{baseline_sha}..{head_sha}"],
+            repository_root,
+            env,
+            max_bytes=100_000,
+        )
+        snapshots: list[dict[str, Any]] = []
+        remaining = 250_000
+        for relative in names.splitlines():
+            if not relative or remaining <= 0:
+                break
+            path = (repository_root / relative).resolve()
+            if not path.is_relative_to(repository_root) or not path.is_file() or path.is_symlink():
+                continue
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            entry: dict[str, Any] = {
+                "path": relative,
+                "sha256": digest,
+                "size_bytes": len(data),
+            }
+            if b"\x00" in data:
+                entry["content_omitted"] = "binary"
+            elif len(data) > 100_000 or len(data) > remaining:
+                entry["content_omitted"] = "size_limit"
+            else:
+                content = data.decode("utf-8", errors="replace")
+                if any(pattern.search(content) for pattern in SECRET_PATTERNS):
+                    entry["content_omitted"] = "potential_secret"
+                else:
+                    entry["content"] = content
+                    remaining -= len(data)
+            snapshots.append(entry)
+        return snapshots
+
+    async def _publish_committed(
+        self,
+        context: dict[str, Any],
+        committed: dict[str, Any],
+        provider_factory: Callable[[str], GitProvider | None],
+    ) -> dict[str, Any]:
+        manifest = context.get("artifacts", {}).get("workspace_manifest")
+        if not manifest:
+            raise GitProviderError("git.workspace_missing", "workspace manifest is missing")
+        root = Path(manifest["workspace_root"]).resolve()
+        if not root.is_relative_to(self.root):
+            raise GitProviderError("git.workspace_escape", "workspace is outside configured root")
+        workspace_by_repository = {item["repository_id"]: item for item in manifest.get("repositories", [])}
+        published: list[dict[str, Any]] = []
+        combined_diff: list[str] = []
+        for commit_item in committed.get("repositories", []):
+            item = workspace_by_repository[commit_item["repository_id"]]
+            repository_root = (root / item["relative_path"]).resolve()
+            if not repository_root.is_relative_to(root):
+                raise GitProviderError("git.workspace_escape", "repository path escapes workspace")
+            env = self._git_env(item["provider"])
+            if self._run(["git", "status", "--porcelain=v1"], repository_root, env).strip():
+                raise GitProviderError("git.commit_dirty", "committed developer workspace changed after review")
+            head_sha = self._run(["git", "rev-parse", "HEAD"], repository_root, env).strip()
+            if head_sha != commit_item["head_sha"]:
+                raise GitProviderError("git.commit_mismatch", "reviewed commit SHA no longer matches workspace HEAD")
+            review_diff = self._run(
+                ["git", "diff", "--no-ext-diff", f"{commit_item['baseline_sha']}..{head_sha}"],
+                repository_root,
+                env,
+                max_bytes=500_000,
+            )
+            if hashlib.sha256(review_diff.encode()).hexdigest() != commit_item.get("diff_sha256"):
+                raise GitProviderError("git.diff_mismatch", "reviewed diff no longer matches committed evidence")
+            self._scan_secrets(review_diff)
+            self._run(
+                ["git", "push", "--force-with-lease", "origin", f"HEAD:refs/heads/{item['work_branch']}"],
+                repository_root,
+                env,
+            )
+            pull_request = await _create_pull_request_or_manual_link(provider_factory, item, context)
+            combined_diff.append(f"## {item['full_name']}\n{review_diff}")
+            published.append(
+                {
+                    "requirement_repository_id": item["requirement_repository_id"],
+                    "repository_id": item["repository_id"],
+                    "work_branch": item["work_branch"],
+                    "baseline_sha": item["baseline_sha"],
+                    "head_sha": head_sha,
+                    "pull_request_number": pull_request["number"],
+                    "pull_request_url": pull_request["url"],
+                    "publication_mode": pull_request["mode"],
+                }
+            )
+        if not published:
+            raise GitProviderError("git.no_changes", "no reviewed commits are available to publish")
+        return {
+            "schema_version": "1.0",
+            "summary": (
+                "Reviewed branches pushed; pull requests created where API credentials were available. "
+                "Tokenless providers expose a manual compare link."
+            ),
+            "repositories": published,
+            "combined_diff": "\n\n".join(combined_diff),
+        }
+
     def _trusted_publish_checkout(
         self,
         requirement_id: str,
@@ -331,6 +567,7 @@ class GitWorkspaceManager:
         manifest_item: dict[str, Any],
         developer_root: Path,
         env: dict[str, str],
+        changed_paths: set[Path] | None = None,
     ) -> Path:
         target = self.publishing / requirement_id / manifest_item["repository_id"]
         shutil.rmtree(target, ignore_errors=True)
@@ -348,12 +585,13 @@ class GitWorkspaceManager:
             ["git", "clone", "--no-tags", "--single-branch", "--branch", branch, "--", clone_url, str(target)],
             self.root,
             env,
+            timeout_seconds=900,
         )
         self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
         self._run(["git", "config", "user.name", "画板 Developer Agent"], target, env)
         self._run(["git", "config", "user.email", "agent@huaban.local"], target, env)
         self._run(["git", "checkout", "-B", manifest_item["work_branch"]], target, env)
-        _sync_untrusted_worktree(developer_root, target)
+        _sync_untrusted_worktree(developer_root, target, changed_paths)
         return target
 
     def cleanup_stale(self, now: float | None = None) -> list[str]:
@@ -406,13 +644,34 @@ class GitWorkspaceManager:
         return env
 
     @staticmethod
-    def _run(argv: list[str], cwd: Path, env: dict[str, str], max_bytes: int = 200_000) -> str:
+    def _run(
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        max_bytes: int = 200_000,
+        timeout_seconds: int = 300,
+    ) -> str:
+        process: subprocess.Popen[bytes] | None = None
         try:
-            completed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, timeout=300, check=False)
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
             raise GitProviderError("git.command_timeout", "Git command timed out", True) from exc
-        output = completed.stdout + completed.stderr
-        if completed.returncode:
+        output = stdout + stderr
+        if process.returncode:
             safe = output[:4000].decode(errors="replace")
             raise GitProviderError("git.command_failed", f"Git command failed: {safe}")
         return output[:max_bytes].decode(errors="replace")
@@ -436,31 +695,209 @@ def _pull_request_body(context: dict[str, Any]) -> str:
     return f"## 画板 delivery\n\n{summary}\n\nRequirement: `{context['requirement_id']}`\n"
 
 
-def _sync_untrusted_worktree(source: Path, destination: Path) -> None:
-    for path in source.rglob("*"):
-        relative = path.relative_to(source)
-        if ".git" in relative.parts:
+async def _create_pull_request_or_manual_link(
+    provider_factory: Callable[[str], GitProvider | None],
+    repository: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    provider = provider_factory(repository["provider"])
+    if provider is None:
+        full_name = "/".join(quote(part, safe="") for part in repository["full_name"].split("/"))
+        base = quote(repository["target_branch"], safe="")
+        head = quote(repository["work_branch"], safe="")
+        if repository["provider"] == "github":
+            url = f"https://github.com/{full_name}/compare/{base}...{head}?expand=1"
+        else:
+            url = f"https://gitlab.com/{full_name}/-/compare/{base}...{head}"
+        return {"number": None, "url": url, "mode": "ssh_branch_only"}
+    try:
+        pull_request = await provider.create_or_update_pull_request(
+            repository["full_name"],
+            repository["work_branch"],
+            repository["target_branch"],
+            f"[画板] {context['title']}",
+            _pull_request_body(context),
+        )
+        return {"number": pull_request.number, "url": pull_request.url, "mode": "pull_request"}
+    finally:
+        if hasattr(provider, "close"):
+            await provider.close()  # type: ignore[attr-defined]
+
+
+def _repository_changed_paths(
+    context: dict[str, Any],
+    manifest_item: dict[str, Any],
+) -> set[Path] | None:
+    raw_paths = context.get("artifacts", {}).get("development_report", {}).get("files_changed")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        return None
+    prefix = str(manifest_item.get("relative_path") or manifest_item.get("repository_id") or "").strip("/")
+    selected: set[Path] = set()
+    for value in raw_paths:
+        if not isinstance(value, str):
             continue
-        if path.is_symlink() or (not path.is_file() and not path.is_dir()):
+        normalized = value.strip("/")
+        if normalized == prefix:
+            continue
+        if prefix and not normalized.startswith(f"{prefix}/"):
+            continue
+        relative = normalized[len(prefix) + 1 :] if prefix else normalized
+        path = Path(relative)
+        if not relative or path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+            raise GitProviderError("git.unsafe_worktree_entry", "developer changed path is invalid")
+        selected.add(path)
+    return selected
+
+
+def _sync_untrusted_worktree(
+    source: Path,
+    destination: Path,
+    changed_paths: set[Path] | None = None,
+) -> None:
+    if changed_paths is not None:
+        ignored = _trusted_ignored_paths(destination, list(changed_paths))
+        if ignored:
             raise GitProviderError(
                 "git.unsafe_worktree_entry",
-                "developer worktree contains a symlink or special file",
+                "developer changed path targets an ignored dependency or build cache",
             )
-    for child in destination.iterdir():
-        if child.name == ".git":
+        for relative in sorted(changed_paths):
+            source_path = source / relative
+            destination_path = destination / relative
+            if not source_path.exists() and not source_path.is_symlink():
+                if destination_path.is_dir() and not destination_path.is_symlink():
+                    shutil.rmtree(destination_path)
+                else:
+                    destination_path.unlink(missing_ok=True)
+                continue
+            if source_path.is_symlink() or not source_path.is_file():
+                raise GitProviderError(
+                    "git.unsafe_worktree_entry",
+                    f"developer change contains a symlink or special file: {relative.as_posix()}",
+                )
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            if destination_path.is_symlink() or destination_path.is_dir():
+                if destination_path.is_dir() and not destination_path.is_symlink():
+                    shutil.rmtree(destination_path)
+                else:
+                    destination_path.unlink()
+            shutil.copy2(source_path, destination_path)
+        return
+
+    tracked_result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=destination,
+        capture_output=True,
+        check=False,
+    )
+    if tracked_result.returncode:
+        raise GitProviderError("git.command_failed", "Unable to enumerate trusted repository files")
+    tracked = {
+        Path(value.decode(errors="surrogateescape"))
+        for value in tracked_result.stdout.split(b"\0")
+        if value
+    }
+
+    # Dependency preparation intentionally leaves ignored caches (for example
+    # node_modules) in the developer workspace.  Do not copy or security-scan
+    # those caches as source changes.  Ignore decisions are made by the clean,
+    # trusted checkout before any developer-controlled files are overlaid.
+    source_entries: dict[Path, Path] = {}
+    for current, directory_names, file_names in os.walk(source, topdown=True, followlinks=False):
+        current_path = Path(current)
+        relative_root = current_path.relative_to(source)
+        candidates: list[Path] = []
+        directory_paths: dict[str, tuple[Path, Path]] = {}
+        for name in directory_names:
+            if relative_root == Path(".") and name == ".git":
+                continue
+            path = current_path / name
+            relative = path.relative_to(source)
+            directory_paths[name] = (relative, path)
+            candidates.append(relative)
+        file_paths: dict[str, tuple[Path, Path]] = {}
+        for name in file_names:
+            if relative_root == Path(".") and name == ".git":
+                continue
+            path = current_path / name
+            relative = path.relative_to(source)
+            file_paths[name] = (relative, path)
+            candidates.append(relative)
+
+        ignored = _trusted_ignored_paths(destination, candidates)
+        retained_directories: list[str] = []
+        for name, (relative, path) in directory_paths.items():
+            if relative in ignored:
+                continue
+            if path.is_symlink():
+                source_entries[relative] = path
+                continue
+            retained_directories.append(name)
+        directory_names[:] = retained_directories
+        for relative, path in file_paths.values():
+            if relative not in ignored:
+                source_entries[relative] = path
+
+    for relative in tracked:
+        source_path = source / relative
+        destination_path = destination / relative
+        if not source_path.exists() and not source_path.is_symlink():
+            if destination_path.is_dir() and not destination_path.is_symlink():
+                shutil.rmtree(destination_path)
+            else:
+                destination_path.unlink(missing_ok=True)
             continue
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
-    for child in source.iterdir():
-        if child.name == ".git":
+        if source_path.is_symlink():
+            if not destination_path.is_symlink() or os.readlink(source_path) != os.readlink(destination_path):
+                raise GitProviderError(
+                    "git.unsafe_worktree_entry",
+                    f"developer change contains an unsupported symlink: {relative.as_posix()}",
+                )
+            source_entries.pop(relative, None)
             continue
-        target = destination / child.name
-        if child.is_dir():
-            shutil.copytree(child, target)
-        else:
-            shutil.copy2(child, target)
+        if not source_path.is_file():
+            raise GitProviderError(
+                "git.unsafe_worktree_entry",
+                f"developer change contains a special file: {relative.as_posix()}",
+            )
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if destination_path.is_symlink() or destination_path.is_dir():
+            if destination_path.is_dir() and not destination_path.is_symlink():
+                shutil.rmtree(destination_path)
+            else:
+                destination_path.unlink()
+        shutil.copy2(source_path, destination_path)
+        source_entries.pop(relative, None)
+
+    for relative, source_path in source_entries.items():
+        if source_path.is_symlink() or not source_path.is_file():
+            raise GitProviderError(
+                "git.unsafe_worktree_entry",
+                f"developer change contains a symlink or special file: {relative.as_posix()}",
+            )
+        destination_path = destination / relative
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination_path)
+
+
+def _trusted_ignored_paths(repository: Path, paths: list[Path]) -> set[Path]:
+    if not paths:
+        return set()
+    payload = b"\0".join(os.fsencode(path.as_posix()) for path in paths) + b"\0"
+    completed = subprocess.run(
+        ["git", "check-ignore", "-z", "--stdin"],
+        cwd=repository,
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode not in {0, 1}:
+        raise GitProviderError("git.command_failed", "Unable to evaluate trusted ignore rules")
+    return {
+        Path(os.fsdecode(value))
+        for value in completed.stdout.split(b"\0")
+        if value
+    }
 
 
 def _repository_analysis_snapshot(root: Path, content_budget: int) -> tuple[dict[str, Any], int]:

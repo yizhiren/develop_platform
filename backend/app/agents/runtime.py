@@ -1,4 +1,6 @@
+import base64
 import json
+from pathlib import Path
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -11,7 +13,9 @@ from ..schemas.domain import (
     DevelopmentReport,
 )
 from .prompts import ROLE_PROMPTS
-from .providers import LLMProvider, ModelProviderError, ModelResponse
+from ..services.artifacts import ArtifactStore, ArtifactStoreError
+from ..services.requirement_attachments import MAX_REQUIREMENT_IMAGE_BYTES
+from .providers import LLMProvider, ModelImage, ModelProviderError, ModelResponse
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -33,8 +37,9 @@ class AgentOutputError(ValueError):
 
 
 class AgentRuntime:
-    def __init__(self, provider: LLMProvider):
+    def __init__(self, provider: LLMProvider, artifact_root: Path | None = None):
         self.provider = provider
+        self.artifact_root = artifact_root
 
     async def run(self, role: str, context: dict[str, Any]) -> tuple[BaseModel, ModelResponse]:
         schema = ROLE_SCHEMAS.get(role)
@@ -43,8 +48,13 @@ class AgentRuntime:
             raise ValueError(f"unsupported agent role: {role}")
         schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
         system = f"{prompt}\nJSON Schema:\n{schema_json}"
-        user = json.dumps(context, ensure_ascii=False)
-        response = await self.provider.complete(system, user)
+        model_context = _context_without_attachment_paths(context)
+        user = json.dumps(model_context, ensure_ascii=False)
+        images = self.load_images(context)
+        if images:
+            response = await self.provider.complete_with_images(system, user, images)
+        else:
+            response = await self.provider.complete(system, user)
         try:
             parsed = schema.model_validate_json(response.content)
         except ValidationError as exc:
@@ -61,6 +71,49 @@ class AgentRuntime:
                 model=repaired.model or response.model,
             )
         return parsed, response
+
+    def load_images(self, context: dict[str, Any]) -> list[ModelImage]:
+        if not self.provider.supports_image_input or self.artifact_root is None:
+            return []
+        attachments = context.get("attachments")
+        if not isinstance(attachments, list):
+            return []
+        store = ArtifactStore(self.artifact_root)
+        images: list[ModelImage] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            media_type = str(attachment.get("media_type") or "")
+            relative_path = str(attachment.get("path") or "")
+            if media_type not in {"image/png", "image/jpeg", "image/webp"} or not relative_path:
+                continue
+            try:
+                content = store.resolve(relative_path).read_bytes()
+            except (ArtifactStoreError, OSError):
+                continue
+            if not content or len(content) > MAX_REQUIREMENT_IMAGE_BYTES:
+                continue
+            images.append(
+                ModelImage(
+                    filename=str(attachment.get("filename") or "screenshot"),
+                    media_type=media_type,
+                    data_url=f"data:{media_type};base64,{base64.b64encode(content).decode()}",
+                )
+            )
+        return images
+
+
+def _context_without_attachment_paths(context: dict[str, Any]) -> dict[str, Any]:
+    result = dict(context)
+    attachments = context.get("attachments")
+    if isinstance(attachments, list):
+        result["attachments"] = [
+            {key: value for key, value in attachment.items() if key != "path"}
+            if isinstance(attachment, dict)
+            else attachment
+            for attachment in attachments
+        ]
+    return result
 
 
 __all__ = ["AgentRuntime", "AgentOutputError", "ModelProviderError"]

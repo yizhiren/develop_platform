@@ -15,27 +15,38 @@ from .providers.github import GitHubProvider
 from .providers.gitlab import GitLabProvider
 from .services.git_workspace import GitWorkspaceManager
 from .services.leases import TaskLease
+from .services.task_progress import publish_task_running
+from .services.diagnostics import safe_error_message
+from .services.provider_secrets import ProviderSecretError, ProviderSecretStore
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forgeflow.git_worker")
 
 
-def build_provider(provider_name: str) -> GitProvider:
+def build_provider(provider_name: str) -> GitProvider | None:
     settings = get_settings()
+    if provider_name not in {"github", "gitlab"}:
+        raise GitProviderError("git.unsupported_provider", f"unsupported provider {provider_name}")
+    try:
+        managed_token = ProviderSecretStore(settings.provider_secret_root).read(provider_name)
+    except ProviderSecretError as exc:
+        raise GitProviderError("git.invalid_provider_secret", str(exc)) from exc
     if provider_name == "github":
-        if not settings.github_token:
-            raise GitProviderError("github.missing_token", "GitHub token is not configured")
-        return GitHubProvider(settings.github_token, settings.github_webhook_secret)
+        token = managed_token or settings.github_token
+        if not token:
+            return None
+        return GitHubProvider(token, settings.github_webhook_secret)
     if provider_name == "gitlab":
-        if not settings.gitlab_token:
-            raise GitProviderError("gitlab.missing_token", "GitLab token is not configured")
+        token = managed_token or settings.gitlab_token
+        if not token:
+            return None
         return GitLabProvider(
-            settings.gitlab_token,
+            token,
             settings.gitlab_webhook_secret,
             f"{settings.gitlab_base_url.rstrip('/')}/api/v4",
         )
-    raise GitProviderError("git.unsupported_provider", f"unsupported provider {provider_name}")
+    raise AssertionError("validated provider was not handled")
 
 
 async def execute_task(
@@ -52,6 +63,18 @@ async def execute_task(
     if task_type == "git.prepare_analysis":
         manager = workspace_manager or GitWorkspaceManager(get_settings())
         output = await asyncio.to_thread(manager.prepare_analysis, context)
+        return {"task_id": envelope["task_id"], "status": "completed", "output": output}
+    if task_type == "git.restore_workspaces":
+        manager = workspace_manager or GitWorkspaceManager(get_settings())
+        output = await asyncio.to_thread(manager.restore, context)
+        return {"task_id": envelope["task_id"], "status": "completed", "output": output}
+    if task_type == "git.restore_validation_workspace":
+        manager = workspace_manager or GitWorkspaceManager(get_settings())
+        output = await asyncio.to_thread(manager.restore, context)
+        return {"task_id": envelope["task_id"], "status": "completed", "output": output}
+    if task_type == "git.commit_changes":
+        manager = workspace_manager or GitWorkspaceManager(get_settings())
+        output = await asyncio.to_thread(manager.commit, context)
         return {"task_id": envelope["task_id"], "status": "completed", "output": output}
     if task_type == "git.publish_changes":
         manager = workspace_manager or GitWorkspaceManager(get_settings())
@@ -70,6 +93,42 @@ async def execute_task(
         manager = workspace_manager or GitWorkspaceManager(get_settings())
         output = await asyncio.to_thread(manager.prepare_verification, context, False, True)
         return {"task_id": envelope["task_id"], "status": "completed", "output": output}
+    if task_type == "git.create_pull_request":
+        selected = provider or build_provider(context["provider"])
+        if selected is None:
+            variable = "GITHUB_TOKEN" if context["provider"] == "github" else "GITLAB_TOKEN"
+            raise GitProviderError(
+                "git.missing_provider_token",
+                f"provider token is not configured; set {variable} and restart git-worker",
+            )
+        try:
+            pull_request = await selected.create_or_update_pull_request(
+                context["repository"],
+                context["work_branch"],
+                context["target_branch"],
+                f"[画板] {context['title']}",
+                "## 画板 delivery\n\n"
+                f"{context.get('description') or 'Automated implementation produced by 画板.'}\n\n"
+                f"Requirement: `{context['requirement_id']}`\n",
+            )
+            if pull_request.head_sha.lower() != context["head_sha"].lower():
+                raise GitProviderError(
+                    "git.pull_request_head_mismatch",
+                    "created pull request head does not match reviewed head SHA",
+                )
+            return {
+                "task_id": envelope["task_id"],
+                "status": "completed",
+                "output": {
+                    "requirement_repository_id": context["requirement_repository_id"],
+                    "pull_request_number": pull_request.number,
+                    "pull_request_url": pull_request.url,
+                    "head_sha": pull_request.head_sha,
+                },
+            }
+        finally:
+            if provider is None and hasattr(selected, "close"):
+                await selected.close()  # type: ignore[attr-defined]
     if task_type != "git.merge_next":
         raise GitProviderError("git.unsupported_task", f"unsupported task {task_type}")
     selected = provider or build_provider(context["provider"])
@@ -113,6 +172,12 @@ async def run_worker() -> None:
                     worker_id,
                     settings.task_lease_seconds,
                     settings.max_parallel_requirements,
+                    on_heartbeat=lambda task_id=envelope["task_id"]: publish_task_running(
+                        redis,
+                        task_id,
+                        worker_id,
+                        settings.task_lease_seconds,
+                    ),
                 )
                 if not await lease.acquire():
                     await redis.xack(stream, group, message_id)
@@ -120,10 +185,29 @@ async def run_worker() -> None:
                 try:
                     result = await execute_task(envelope)
                 except GitProviderError as exc:
-                    result = {"task_id": envelope["task_id"], "status": "failed", "error_code": exc.code, "retryable": exc.retryable}
-                except Exception:
+                    message = safe_error_message(exc)
+                    logger.error(
+                        "git task failed: task_id=%s code=%s detail=%s",
+                        envelope["task_id"],
+                        exc.code,
+                        message,
+                    )
+                    result = {
+                        "task_id": envelope["task_id"],
+                        "status": "failed",
+                        "error_code": exc.code,
+                        "error_message": message,
+                        "retryable": exc.retryable,
+                    }
+                except Exception as exc:
                     logger.exception("unhandled git task failure")
-                    result = {"task_id": envelope["task_id"], "status": "failed", "error_code": "git.internal", "retryable": True}
+                    result = {
+                        "task_id": envelope["task_id"],
+                        "status": "failed",
+                        "error_code": "git.internal",
+                        "error_message": safe_error_message(exc) or "unexpected Git worker failure",
+                        "retryable": True,
+                    }
                 await redis.xadd("forgeflow:results", {"payload": json.dumps(result)}, maxlen=10_000, approximate=True)
                 await redis.xack(stream, group, message_id)
                 await lease.complete()

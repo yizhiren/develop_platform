@@ -18,7 +18,7 @@ def test_agent_model_profiles_inherit_shared_values_and_allow_overrides() -> Non
         agent1_llm_base_url="",
         agent1_llm_model="",
         agent1_llm_api_key="",
-        agent2_llm_provider="",
+        agent2_llm_provider="openai",
         agent2_llm_base_url="https://architect.example/v1",
         agent2_llm_model="architect-model",
         agent2_llm_api_key="architect-key",
@@ -40,11 +40,14 @@ def test_agent_model_profiles_inherit_shared_values_and_allow_overrides() -> Non
         "shared-key",
     )
     agent2 = settings.agent_model_config("agent2")
-    assert (agent2.base_url, agent2.model, agent2.api_key) == (
+    assert (agent2.provider, agent2.base_url, agent2.model, agent2.api_key) == (
+        "openai",
         "https://architect.example/v1",
         "architect-model",
         "architect-key",
     )
+    settings.agent2_llm_api_key = ""
+    assert settings.agent_model_config("agent2").api_key == ""
     assert settings.agent_model_config("agent3").provider == "fake"
     assert "shared-key" not in repr(agent1)
     assert "architect-key" not in repr(agent2)
@@ -68,7 +71,7 @@ def test_worker_builds_four_runtimes_and_reads_shared_key_file_once(
         agent1_llm_base_url="",
         agent1_llm_model="",
         agent1_llm_api_key="",
-        agent2_llm_provider="",
+        agent2_llm_provider="openai",
         agent2_llm_base_url="",
         agent2_llm_model="architect-model",
         agent2_llm_api_key="architect-secret",
@@ -93,5 +96,13 @@ def test_worker_builds_four_runtimes_and_reads_shared_key_file_once(
     assert runtimes["agent1"].provider.api_key == "shared-secret"
     assert runtimes["agent2"].provider.api_key == "architect-secret"
     assert runtimes["agent2"].provider.model == "architect-model"
+    assert runtimes["agent2"].provider.thinking_enabled is None
+    assert runtimes["agent2"].provider.reasoning_effort == "none"
+    assert runtimes["agent2"].provider.max_tokens_field == "max_completion_tokens"
+    assert runtimes["agent2"].provider.supports_image_input is True
+    assert runtimes["agent1"].provider.thinking_enabled is False
+    assert runtimes["agent1"].provider.reasoning_effort is None
+    assert runtimes["agent1"].provider.max_tokens_field == "max_tokens"
+    assert runtimes["agent1"].provider.supports_image_input is False
     assert runtimes["agent4"].provider.model == "acceptance-model"
     assert not key_file.exists()

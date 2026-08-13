@@ -7,6 +7,7 @@ from pathlib import Path
 
 from redis.asyncio import Redis
 
+from .agents.acceptance import ACCEPTANCE_ROLES, AcceptanceToolLoop, verification_manifest
 from .agents.providers import FakeLLMProvider, OpenAICompatibleProvider
 from .agents.coding import DeveloperToolLoop
 from .agents.roles import AGENT_KEYS, agent_key_for_role
@@ -14,10 +15,42 @@ from .agents.runtime import AgentOutputError, AgentRuntime, ModelProviderError
 from .agents.verification import run_recorded_tests
 from .core.config import get_settings
 from .services.leases import TaskLease
+from .services.diagnostics import safe_error_message
+from .services.task_progress import publish_task_running
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("forgeflow.worker")
+
+
+class DeveloperWorkspaceMissing(AgentOutputError):
+    code = "agent.workspace_missing"
+    retryable = False
+
+
+class AcceptanceWorkspaceMissing(AgentOutputError):
+    code = "agent.verification_workspace_missing"
+    retryable = False
+
+
+def _agent_failure_result(task_id: str, exc: Exception, model: str = "") -> dict:
+    message = safe_error_message(exc) or "Agent failed without an error message"
+    code = str(getattr(exc, "code", "agent.invalid_output"))[:80]
+    logger.error("agent task failed: task_id=%s code=%s detail=%s", task_id, code, message)
+    result = {
+        "task_id": task_id,
+        "status": "failed",
+        "error_code": code,
+        "error_message": message,
+        "retryable": bool(getattr(exc, "retryable", False)),
+        "token_usage": int(getattr(exc, "token_usage", 0)),
+    }
+    if model:
+        result["model"] = model
+    changed_paths = getattr(exc, "changed_paths", None)
+    if isinstance(changed_paths, list):
+        result["changed_paths"] = [str(path)[:1_000] for path in changed_paths[:200]]
+    return result
 
 
 def build_runtimes() -> dict[str, AgentRuntime]:
@@ -32,15 +65,22 @@ def build_runtimes() -> dict[str, AgentRuntime]:
             secret_cache,
         )
         if profile.provider == "fake":
-            runtimes[agent_key] = AgentRuntime(FakeLLMProvider())
+            runtimes[agent_key] = AgentRuntime(FakeLLMProvider(), settings.artifact_root)
         else:
+            is_openai = profile.provider == "openai"
             runtimes[agent_key] = AgentRuntime(
                 OpenAICompatibleProvider(
                     profile.base_url,
                     model_api_key,
                     profile.model,
                     thinking_enabled=False if profile.provider == "deepseek" else None,
-                )
+                    reasoning_effort="none" if is_openai else None,
+                    max_tokens_field=(
+                        "max_completion_tokens" if is_openai else "max_tokens"
+                    ),
+                    vision_enabled=is_openai,
+                ),
+                settings.artifact_root,
             )
     return runtimes
 
@@ -71,6 +111,36 @@ def _read_model_api_key(
     return value
 
 
+def _should_run_developer_tool_loop(
+    role: str,
+    context: dict,
+    repository_automation_enabled: bool,
+) -> bool:
+    if role != "develop":
+        return False
+    has_workspace = bool(context.get("artifacts", {}).get("workspace_manifest"))
+    if repository_automation_enabled and not has_workspace:
+        raise DeveloperWorkspaceMissing(
+            "repository automation requires a real developer workspace"
+        )
+    return has_workspace
+
+
+def _should_run_acceptance_tool_loop(
+    role: str,
+    context: dict,
+    repository_automation_enabled: bool,
+) -> bool:
+    if role not in ACCEPTANCE_ROLES:
+        return False
+    has_workspace = bool(verification_manifest(context, role).get("workspace_root"))
+    if repository_automation_enabled and not has_workspace:
+        raise AcceptanceWorkspaceMissing(
+            "repository automation requires a clean verification workspace for Agent4"
+        )
+    return has_workspace
+
+
 async def run_worker() -> None:
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -97,6 +167,12 @@ async def run_worker() -> None:
                     worker_id,
                     settings.task_lease_seconds,
                     settings.max_parallel_requirements,
+                    on_heartbeat=lambda task_id=envelope["task_id"]: publish_task_running(
+                        redis,
+                        task_id,
+                        worker_id,
+                        settings.task_lease_seconds,
+                    ),
                 )
                 if not await lease.acquire():
                     await redis.xack(stream, group, message_id)
@@ -111,15 +187,30 @@ async def run_worker() -> None:
                 runtime = runtimes[agent_key_for_role(role)]
                 context = envelope["payload"].get("context", {})
                 try:
-                    if role == "develop" and context.get("artifacts", {}).get("workspace_manifest"):
+                    if _should_run_developer_tool_loop(
+                        role,
+                        context,
+                        settings.repository_automation_enabled,
+                    ):
                         output, response = await DeveloperToolLoop(runtime.provider).run(context)
                     else:
                         verification = []
-                        if role in {"accept", "final_accept", "regression"}:
+                        if role in ACCEPTANCE_ROLES:
                             verification = await asyncio.to_thread(run_recorded_tests, context)
                             if verification:
                                 context = {**context, "runtime_verification": verification}
-                        output, response = await runtime.run(role, context)
+                        if _should_run_acceptance_tool_loop(
+                            role,
+                            context,
+                            settings.repository_automation_enabled,
+                        ):
+                            output, response = await AcceptanceToolLoop(
+                                runtime.provider,
+                                role,
+                                images=runtime.load_images(context),
+                            ).run(context)
+                        else:
+                            output, response = await runtime.run(role, context)
                         if verification and any(item.get("status") != "passed" for item in verification):
                             output.approved = False
                             output.summary = f"平台复跑测试失败，禁止验收通过。{output.summary}"
@@ -131,19 +222,20 @@ async def run_worker() -> None:
                         "model": response.model,
                     }
                 except (ModelProviderError, AgentOutputError) as exc:
-                    result = {
-                        "task_id": envelope["task_id"],
-                        "status": "failed",
-                        "error_code": getattr(exc, "code", "agent.invalid_output"),
-                        "retryable": getattr(exc, "retryable", False),
-                    }
-                except Exception:
+                    result = _agent_failure_result(
+                        envelope["task_id"],
+                        exc,
+                        str(getattr(runtime.provider, "model", "")),
+                    )
+                except Exception as exc:
                     logger.exception("unhandled agent task failure")
                     result = {
                         "task_id": envelope["task_id"],
                         "status": "failed",
                         "error_code": "agent.internal",
+                        "error_message": safe_error_message(exc) or "unexpected Agent worker failure",
                         "retryable": True,
+                        "model": str(getattr(runtime.provider, "model", "")),
                     }
                 await redis.xadd(
                     "forgeflow:results",

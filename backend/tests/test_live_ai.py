@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from app.agents.acceptance import AcceptanceToolLoop
 from app.agents.providers import OpenAICompatibleProvider
 from app.agents.coding import DeveloperToolLoop
 from app.agents.runtime import AgentRuntime, ROLE_SCHEMAS
@@ -128,6 +129,62 @@ async def test_deepseek_developer_tool_loop_changes_code_and_runs_tests(
     branch = delivery["repositories"][0]["work_branch"]
     assert "return left + right" in _git("show", f"{branch}:calculator.py", cwd=remote)
     assert delivery["repositories"][0]["pull_request_number"] == 23
+
+
+async def test_deepseek_acceptance_tool_loop_selects_and_runs_independent_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This standalone test container does not mount the production executor socket.
+    monkeypatch.delenv("SANDBOX_EXECUTOR_SOCKET", raising=False)
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    (repository / "calculator.py").write_text("def add(left, right):\n    return left + right\n")
+    (repository / "test_calculator.py").write_text(
+        "from calculator import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+    )
+    provider = OpenAICompatibleProvider(
+        os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
+        os.environ["DEEPSEEK_API_KEY"],
+        os.getenv("LLM_MODEL", "deepseek-v4-flash"),
+        timeout=float(os.getenv("LIVE_AI_TIMEOUT_SECONDS", "60")),
+        max_tokens=int(os.getenv("LIVE_AI_MAX_TOKENS", "1500")),
+    )
+    context = {
+        "requirement_id": "live-acceptance-1",
+        "title": "验收加法函数",
+        "description": "calculator.add 必须返回两数之和，并由验收工程师独立运行测试。",
+        "artifacts": {
+            "clarification_spec": {
+                "acceptance_criteria": [
+                    {
+                        "id": "AC-1",
+                        "description": "add(2, 3) 返回 5",
+                        "verification_method": "在 repo-1 运行 pytest -q",
+                        "priority": "must",
+                    }
+                ]
+            },
+            "architecture_plan": {"test_strategy": ["在 repo-1 运行 pytest -q"]},
+            "verification_manifest": {
+                "workspace_root": str(tmp_path),
+                "checkout_type": "published_heads",
+                "repositories": [{"repository_id": "repo-1", "relative_path": "repo-1"}],
+            },
+        },
+    }
+
+    report, response = await AcceptanceToolLoop(provider, max_steps=8).run(context)
+
+    assert report.approved is True
+    assert report.criteria[0].criterion_id == "AC-1"
+    assert any(
+        item.get("source") == "agent4_independent"
+        and item.get("type") == "command"
+        and item.get("status") == "passed"
+        for item in report.regression_results
+    )
+    assert response.model
 
 
 class _StubPullRequestProvider(GitProvider):

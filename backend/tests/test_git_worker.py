@@ -8,6 +8,7 @@ class StubProvider(GitProvider):
     def __init__(self, checks):
         self.checks = checks
         self.merge_calls = []
+        self.pull_request_calls = []
 
     async def get_checks(self, repository, sha):
         return self.checks
@@ -23,6 +24,7 @@ class StubProvider(GitProvider):
         return base_sha
 
     async def create_or_update_pull_request(self, repository, head, base, title, body):
+        self.pull_request_calls.append((repository, head, base, title, body))
         return PullRequestRef(1, "https://example.invalid/pr/1", "abc1234", "open")
 
     def verify_webhook(self, body, headers):
@@ -51,3 +53,37 @@ async def test_git_worker_rejects_pending_checks():
     with pytest.raises(GitProviderError, match="not green"):
         await execute_task(envelope(), provider)
     assert provider.merge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_git_worker_creates_pull_request_for_reviewed_head():
+    provider = StubProvider([])
+    result = await execute_task(
+        {
+            "task_id": "task-pr",
+            "task_type": "git.create_pull_request",
+            "payload": {
+                "context": {
+                    "provider": "github",
+                    "repository": "acme/api",
+                    "requirement_id": "req-1",
+                    "requirement_repository_id": "link-1",
+                    "work_branch": "huaban/req-1",
+                    "target_branch": "main",
+                    "head_sha": "abc1234",
+                    "title": "Feature",
+                    "description": "Description",
+                }
+            },
+        },
+        provider,
+    )
+
+    assert result["output"]["pull_request_number"] == 1
+    assert result["output"]["head_sha"] == "abc1234"
+    assert provider.pull_request_calls[0][:4] == (
+        "acme/api",
+        "huaban/req-1",
+        "main",
+        "[画板] Feature",
+    )

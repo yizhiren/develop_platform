@@ -5,7 +5,7 @@ import pytest
 from app.core.config import Settings
 from app.providers.git import GitProviderError
 from app.services.git_workspace import GitWorkspaceManager
-from app.services.repository_urls import validate_clone_url
+from app.services.repository_urls import validate_clone_url, validate_pull_request_url
 
 
 @pytest.mark.parametrize(
@@ -51,3 +51,35 @@ def test_git_environment_is_noninteractive_and_uses_strict_host_keys(tmp_path: P
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
     assert "StrictHostKeyChecking=yes" in env["GIT_SSH_COMMAND"]
+
+
+def test_accepts_matching_manual_pull_request_url() -> None:
+    validate_pull_request_url(
+        "github",
+        "acme/service",
+        42,
+        "https://github.com/acme/service/pull/42",
+        "https://gitlab.com",
+    )
+    validate_pull_request_url(
+        "gitlab",
+        "team/service",
+        7,
+        "https://gitlab.example.com/team/service/-/merge_requests/7",
+        "https://gitlab.example.com",
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/acme/service/pull/42",
+        "https://github.com/acme/other/pull/42",
+        "https://github.com/acme/service/pull/41",
+        "https://user:token@github.com/acme/service/pull/42",
+        "https://github.com/acme/service/pull/42?token=secret",
+    ],
+)
+def test_rejects_mismatched_manual_pull_request_url(url: str) -> None:
+    with pytest.raises(GitProviderError):
+        validate_pull_request_url("github", "acme/service", 42, url, "https://gitlab.com")

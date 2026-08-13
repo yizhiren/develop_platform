@@ -8,11 +8,19 @@ from sqlalchemy import select
 
 from ..core.config import get_settings
 from ..database import SessionLocal
-from ..models.entities import OutboxEvent, RuntimeCursor, WorkflowTask
+from ..models.entities import AgentRun, OutboxEvent, RuntimeCursor, WorkflowTask
 from .task_results import process_task_result
 
 
 logger = logging.getLogger(__name__)
+
+
+def task_stream(task_type: str) -> str:
+    if task_type.startswith("agent."):
+        return "forgeflow:agent-tasks"
+    if task_type.startswith("dependency."):
+        return "forgeflow:dependency-tasks"
+    return "forgeflow:git-tasks"
 
 
 class OutboxScheduler:
@@ -26,6 +34,7 @@ class OutboxScheduler:
         self.reconcile_unpublished_tasks()
         while not self._stop.is_set():
             try:
+                self.recover_expired_running_tasks()
                 await self.publish_pending()
                 await self.consume_results()
             except Exception:
@@ -55,10 +64,67 @@ class OutboxScheduler:
                 except (TypeError, json.JSONDecodeError):
                     continue
                 task = session.get(WorkflowTask, task_id)
-                if task is not None and task.status == "queued":
-                    event.published = False
-                    event.published_at = None
-                    changed = True
+                if task is None:
+                    continue
+                if task.status == "running":
+                    now = datetime.now(UTC)
+                    if task.lease_expires_at is not None and task.lease_expires_at.tzinfo is None:
+                        now = now.replace(tzinfo=None)
+                    if task.lease_expires_at is not None and task.lease_expires_at > now:
+                        continue
+                    task.status = "queued"
+                    task.lease_owner = None
+                    task.lease_expires_at = None
+                    if task.agent_run_id:
+                        run = session.get(AgentRun, task.agent_run_id)
+                        if run is not None and run.status == "running":
+                            run.status = "queued"
+                if task.status != "queued":
+                    continue
+                event.published = False
+                event.published_at = None
+                changed = True
+            if changed:
+                session.commit()
+
+    def recover_expired_running_tasks(self) -> None:
+        """Return stale DB running markers to the durable outbox after lease loss."""
+        with SessionLocal() as session:
+            now = datetime.now(UTC)
+            tasks = session.scalars(
+                select(WorkflowTask)
+                .where(
+                    WorkflowTask.status == "running",
+                    WorkflowTask.lease_expires_at.is_not(None),
+                    WorkflowTask.lease_expires_at <= now,
+                )
+                .limit(100)
+            ).all()
+            changed = False
+            for task in tasks:
+                task.status = "queued"
+                task.lease_owner = None
+                task.lease_expires_at = None
+                if task.agent_run_id:
+                    run = session.get(AgentRun, task.agent_run_id)
+                    if run is not None and run.status == "running":
+                        run.status = "queued"
+                events = session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.aggregate_id == task.requirement_id,
+                        OutboxEvent.published.is_(True),
+                    )
+                ).all()
+                for event in events:
+                    try:
+                        event_task_id = json.loads(event.payload_json).get("task_id")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if event_task_id == task.id:
+                        event.published = False
+                        event.published_at = None
+                        changed = True
+                        break
             if changed:
                 session.commit()
 
@@ -70,14 +136,19 @@ class OutboxScheduler:
             for event in events:
                 envelope = json.loads(event.payload_json)
                 task = session.get(WorkflowTask, envelope.get("task_id"))
-                if task is not None:
-                    now = datetime.now(UTC)
-                    if task.available_at.tzinfo is None:
-                        now = now.replace(tzinfo=None)
-                    if task.available_at > now:
-                        continue
+                if task is None or task.status != "queued":
+                    # A requirement may have been closed after this outbox row
+                    # was created. Consume the row without publishing stale work.
+                    event.published = True
+                    event.published_at = datetime.now(UTC)
+                    continue
+                now = datetime.now(UTC)
+                if task.available_at.tzinfo is None:
+                    now = now.replace(tzinfo=None)
+                if task.available_at > now:
+                    continue
                 task_type = str(envelope.get("task_type", ""))
-                stream = "forgeflow:agent-tasks" if task_type.startswith("agent.") else "forgeflow:git-tasks"
+                stream = task_stream(task_type)
                 await self.redis.xadd(
                     stream,
                     {"event_id": event.id, "payload": event.payload_json},

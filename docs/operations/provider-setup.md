@@ -2,19 +2,38 @@
 
 ## 安全原则
 
-- 使用专用机器人/服务账号和专用测试仓，Token 只写入被忽略的 `.env.local`，不要提交到仓库或粘贴到需求讨论。
-- Token 设置过期时间、最小仓库范围并定期轮换。Git Worker 是唯一接收 Token 的服务；Control Plane 和 Agent Worker 不接收。
+- 使用专用机器人/服务账号和专用测试仓。Token 可由系统管理员在“平台设置 → Provider 凭据”中保存，或写入被忽略的 `.env.local`；不要提交到仓库或粘贴到需求讨论。
+- Token 设置过期时间、最小仓库范围并定期轮换。页面保存时 Control Plane 只接收一次写入请求并写入受限 Secret Volume，响应和审计不含明文；Git Worker 对该 Volume 只有只读访问。Agent Worker、Sandbox 和 Web 不挂载 Provider Secret。
 - Web URL 必须是不带凭据的 HTTPS；clone URL 可以使用无凭据 HTTPS、`git@host:owner/repo.git` 或 `ssh://git@host/owner/repo.git`。主机必须匹配对应 Provider，SSH 用户必须是 `git`。
 - 主机 `${HOST_SSH_DIR:-$HOME/.ssh}` 只读挂载给 Git Worker。先在主机执行 `ssh -T git@github.com`（或 GitLab 对应命令）接受 Host Key 并确认私钥可非交互使用。
 
 ## GitHub
 
-优先使用 GitHub App installation token；本地试运行可以使用仅授权测试仓的 fine-grained PAT。需要读取仓库/Checks/Commit Status，写入 Contents 与 Pull requests，并允许合并测试 PR。GitHub 的 [Pull Requests API](https://docs.github.com/en/rest/pulls/pulls) 说明创建或更新 PR 需要对来源分支有写权限；具体 Token 权限以 [fine-grained PAT 权限表](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens) 和响应中的 `X-Accepted-GitHub-Permissions` 为准。
+优先使用 GitHub App installation token；本地试运行可以使用仅授权测试仓的 fine-grained PAT。当前实现需要以下仓库权限：
+
+- `Pull requests: Read and write`：创建、查找和更新 PR；
+- `Contents: Read and write`：在人工确认后 squash merge PR；
+- `Checks: Read-only`：合并前读取 Check Runs；
+- `Commit statuses: Read-only`：合并前读取传统 Commit Status。
+
+部分 GitHub fine-grained PAT 编辑界面不会提供 `Checks` 选项。此时画板使用受控兼容门禁：仍读取 Commit Status，并在合并前重新读取 PR，要求 PR 为 open、Provider 返回 `mergeable=true` 与 `mergeable_state=clean`，且 head SHA 与系统架构师评审 SHA 完全一致；最终带 expected SHA 调用 GitHub merge API，由 GitHub 再次强制执行分支保护。除 check-runs 返回 403 外的错误不会触发该兼容路径。
+
+只授权画板管理的具体仓库，不要选择所有仓库。若组织启用了 Token 审批，还需由组织管理员批准。GitHub 的 [Pull Requests API](https://docs.github.com/en/rest/pulls/pulls) 明确要求创建 PR 使用 `Pull requests: write`；具体权限以 [fine-grained PAT 权限表](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens) 和响应中的 `X-Accepted-GitHub-Permissions` 为准。
 
 ```dotenv
 GITHUB_TOKEN=...
 REPOSITORY_AUTOMATION_ENABLED=1
 ```
+
+推荐的页面配置方式不需要编辑文件或重启服务：使用系统管理员账号登录，点击顶部“平台设置”，在 GitHub 卡片中粘贴 Token 并保存。页面之后只显示配置状态，不能读取原 Token；替换时输入新 Token，移除时删除页面托管文件。
+
+修改 `.env.local` 后必须带 `--env-file` 执行；不要直接运行不带参数的 `docker compose up`，否则 Compose 插值会使用开发默认值：
+
+```bash
+docker compose --env-file .env.local up -d --build --force-recreate control-plane git-worker web
+```
+
+使用环境变量时，Compose 只把真实 `GITHUB_TOKEN` 传给 Git Worker；Control Plane 只收到由 Token 是否存在派生出的非敏感 `GITHUB_API_ENABLED` 标志。使用页面托管时，Token 写入独立 Docker Volume，Control Plane 挂载为写入端，Git Worker 挂载为只读端。刷新需求详情后，“手工创建并登记”会升级为“由画板创建 PR”。对于 Token 配置前已经进入“待合并”的需求，点击该按钮会补建或复用同一工作分支的 PR，并校验 GitHub 返回的 head SHA 与系统架构师已评审 SHA 一致。
 
 画板用 `x-access-token` 作为 HTTPS Basic 用户名，通过临时 `http.extraHeader` 传入 Token，不会修改仓库 remote URL。
 

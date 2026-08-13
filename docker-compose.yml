@@ -24,7 +24,7 @@ services:
   storage-init:
     image: redis:7.4-alpine
     user: "0:0"
-    command: ["sh", "-c", "chown -R 10001:10001 /data /artifacts /backups /workspaces /runtime"]
+    command: ["sh", "-c", "chown 0:0 /provider-secrets && chmod 700 /provider-secrets && chown -R 10001:10001 /data /artifacts /backups /workspaces /runtime /provider-secrets /dependency-cache"]
     restart: "no"
     volumes:
       - sqlite-data:/data
@@ -32,6 +32,8 @@ services:
       - backups:/backups
       - *workspace-volume
       - sandbox-runtime:/runtime
+      - provider-secrets:/provider-secrets
+      - dependency-cache:/dependency-cache
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -65,22 +67,27 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
-      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-}
-      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-}
-      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-}
-      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-}
-      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-}
-      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-}
-      AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-}
-      AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-}
-      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-}
-      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-}
-      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-}
-      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-}
+      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-openai}
+      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-gpt-5.6-sol}
+      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-openai}
+      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-gpt-5.6-sol}
+      AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-deepseek}
+      AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-pro}
+      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-openai}
+      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-gpt-5.6-sol}
       REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+      # Non-secret capability flags. Provider tokens remain isolated in Git Worker.
+      GITHUB_API_ENABLED: ${GITHUB_TOKEN:+1}
+      GITLAB_API_ENABLED: ${GITLAB_TOKEN:+1}
+      PROVIDER_SECRET_ROOT: /provider-secrets
     volumes:
       - sqlite-data:/data
       - artifacts:/artifacts
+      - provider-secrets:/provider-secrets
     ports:
       - "8000:8000"
     depends_on:
@@ -103,25 +110,26 @@ services:
     command: ["python", "-m", "app.worker"]
     environment:
       REDIS_URL: redis://redis:6379/0
+      ARTIFACT_ROOT: /artifacts
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-}
-      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-}
-      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-}
+      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-openai}
+      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-gpt-5.6-sol}
       AGENT1_LLM_API_KEY: ${AGENT1_LLM_API_KEY:-}
-      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-}
-      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-}
-      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-}
+      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-openai}
+      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-gpt-5.6-sol}
       AGENT2_LLM_API_KEY: ${AGENT2_LLM_API_KEY:-}
-      AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-}
-      AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-}
-      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-}
+      AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-deepseek}
+      AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-pro}
       AGENT3_LLM_API_KEY: ${AGENT3_LLM_API_KEY:-}
-      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-}
-      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-}
-      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-}
+      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-openai}
+      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.openai.com/v1}
+      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-gpt-5.6-sol}
       AGENT4_LLM_API_KEY: ${AGENT4_LLM_API_KEY:-}
       REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
       WORKSPACE_ROOT: /workspaces
@@ -130,11 +138,14 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
       sandbox-executor:
         condition: service_started
     read_only: true
     volumes:
       - *workspace-volume
+      - artifacts:/artifacts:ro
       - sandbox-runtime:/runtime
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -167,6 +178,35 @@ services:
     cap_drop:
       - ALL
 
+  dependency-worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.dependency_worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WORKSPACE_ROOT: /workspaces
+      DEPENDENCY_CACHE_ROOT: /dependency-cache
+      DEPENDENCY_INSTALL_TIMEOUT_SECONDS: ${DEPENDENCY_INSTALL_TIMEOUT_SECONDS:-900}
+      DEPENDENCY_INSTALL_SCRIPTS: ${DEPENDENCY_INSTALL_SCRIPTS:-0}
+      MAX_PARALLEL_REQUIREMENTS: ${MAX_PARALLEL_REQUIREMENTS:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    read_only: true
+    volumes:
+      - *workspace-volume
+      - dependency-cache:/dependency-cache
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   git-worker:
     build:
       context: .
@@ -182,6 +222,7 @@ services:
       WORKSPACE_ROOT: /workspaces
       ALLOW_LOCAL_GIT: ${ALLOW_LOCAL_GIT:-0}
       MAX_PARALLEL_REQUIREMENTS: ${MAX_PARALLEL_REQUIREMENTS:-2}
+      PROVIDER_SECRET_ROOT: /provider-secrets
     depends_on:
       redis:
         condition: service_healthy
@@ -189,6 +230,7 @@ services:
     volumes:
       - *workspace-volume
       - *host-ssh-volume
+      - provider-secrets:/provider-secrets:ro
     tmpfs:
       - /tmp:size=64m,mode=1777
     security_opt:
@@ -276,3 +318,5 @@ volumes:
   artifacts:
   backups:
   sandbox-runtime:
+  provider-secrets:
+  dependency-cache:

@@ -23,8 +23,24 @@ def git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
+def prepare_local_repository(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote.git"
+    source.mkdir()
+    git("init", "-b", "main", cwd=source)
+    git("config", "user.name", "Test", cwd=source)
+    git("config", "user.email", "test@example.com", cwd=source)
+    (source / "value.txt").write_text("before\n")
+    (source / "generated.js").write_text("generated before\n")
+    (source / ".gitignore").write_text("node_modules/\n")
+    git("add", "value.txt", "generated.js", ".gitignore", cwd=source)
+    git("commit", "-m", "initial", cwd=source)
+    git("clone", "--bare", str(source), str(remote), cwd=tmp_path)
+    return source, remote
+
+
 @pytest.mark.asyncio
-async def test_workspace_prepare_publish_and_push(tmp_path: Path) -> None:
+async def test_workspace_commit_locally_then_publish_reviewed_sha(tmp_path: Path) -> None:
     source = tmp_path / "source"
     remote = tmp_path / "remote.git"
     source.mkdir()
@@ -62,10 +78,39 @@ async def test_workspace_prepare_publish_and_push(tmp_path: Path) -> None:
     git("remote", "set-url", "origin", "file:///tmp/attacker.git", cwd=checkout)
     context["artifacts"]["workspace_manifest"] = manifest
     context["artifacts"]["development_report"] = {"summary": "Changed the value"}
+    commit_result = manager.commit(context)
+    assert commit_result["push_performed"] is False
+    branch = manifest["repositories"][0]["work_branch"]
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=remote,
+        capture_output=True,
+    ).returncode != 0
+    assert git("rev-parse", "HEAD", cwd=checkout) == commit_result["repositories"][0]["head_sha"]
+    assert "+after" in commit_result["combined_diff"]
+    changed_file = commit_result["repositories"][0]["changed_files"][0]
+    assert changed_file["path"] == "value.txt"
+    assert changed_file["content"] == "after\n"
+    assert len(changed_file["sha256"]) == 64
+
+    (checkout / "value.txt").write_text("failed agent residue\n")
+    (checkout / "untracked.txt").write_text("temporary\n")
+    restored = manager.restore(context)
+    assert (checkout / "value.txt").read_text() == "after\n"
+    assert not (checkout / "untracked.txt").exists()
+    assert restored["restored"][0]["discarded_entries"] == 2
+
+    context["artifacts"]["development_commit_manifest"] = commit_result
+    ssh_only = await manager.publish(context, lambda _: None)
+    assert ssh_only["repositories"][0]["publication_mode"] == "ssh_branch_only"
+    assert ssh_only["repositories"][0]["pull_request_number"] is None
+    assert "/compare/main...huaban%2Freq-req-1?expand=1" in ssh_only["repositories"][0]["pull_request_url"]
+    assert git("rev-parse", f"refs/heads/{branch}", cwd=remote) == commit_result["repositories"][0]["head_sha"]
+
     result = await manager.publish(context, lambda _: StubPullRequestProvider())
     assert result["repositories"][0]["pull_request_number"] == 17
-    branch = manifest["repositories"][0]["work_branch"]
     assert git("rev-parse", f"refs/heads/{branch}", cwd=remote) == result["repositories"][0]["head_sha"]
+    assert result["repositories"][0]["head_sha"] == commit_result["repositories"][0]["head_sha"]
     assert "+after" in result["combined_diff"]
     context["artifacts"]["delivery_manifest"] = result
     verification = manager.prepare_verification(context)
@@ -90,4 +135,98 @@ async def test_workspace_prepare_publish_and_push(tmp_path: Path) -> None:
 
     (checkout / "credentials.txt").write_text("api_key=abcdefghijklmnopqrstuvwx\n")
     with pytest.raises(GitProviderError, match="secret"):
-        await manager.publish(context, lambda _: StubPullRequestProvider())
+        manager.commit(context)
+
+
+def test_commit_skips_ignored_dependency_symlinks(tmp_path: Path) -> None:
+    _, remote = prepare_local_repository(tmp_path)
+    settings = Settings(_env_file=None, workspace_root=tmp_path / "workspaces", allow_local_git=True)
+    manager = GitWorkspaceManager(settings)
+    context = {
+        "requirement_id": "req-ignored-cache",
+        "title": "Change tracked source",
+        "repositories": [{
+            "requirement_repository_id": "link-1",
+            "repository_id": "repo-1",
+            "provider": "github",
+            "full_name": "acme/repo",
+            "clone_url": remote.as_uri(),
+            "target_branch": "main",
+        }],
+        "artifacts": {},
+    }
+    manifest = manager.prepare(context)
+    checkout = Path(manifest["workspace_root"]) / "repo-1"
+    (checkout / "value.txt").write_text("after\n")
+    dependency_bin = checkout / "node_modules" / ".bin"
+    dependency_bin.mkdir(parents=True)
+    (checkout / "node_modules" / "tool.js").write_text("module.exports = {}\n")
+    (dependency_bin / "tool").symlink_to("../tool.js")
+    context["artifacts"]["workspace_manifest"] = manifest
+    context["artifacts"]["development_report"] = {"repositories_changed": ["repo-1"]}
+
+    result = manager.commit(context)
+
+    assert "+after" in result["combined_diff"]
+    assert "node_modules" not in result["combined_diff"]
+
+
+def test_commit_only_copies_agent_changed_files_not_validation_outputs(tmp_path: Path) -> None:
+    _, remote = prepare_local_repository(tmp_path)
+    settings = Settings(_env_file=None, workspace_root=tmp_path / "workspaces", allow_local_git=True)
+    manager = GitWorkspaceManager(settings)
+    context = {
+        "requirement_id": "req-selected-files",
+        "title": "Change tracked source",
+        "repositories": [{
+            "requirement_repository_id": "link-1",
+            "repository_id": "repo-1",
+            "provider": "github",
+            "full_name": "acme/repo",
+            "clone_url": remote.as_uri(),
+            "target_branch": "main",
+        }],
+        "artifacts": {},
+    }
+    manifest = manager.prepare(context)
+    checkout = Path(manifest["workspace_root"]) / "repo-1"
+    (checkout / "value.txt").write_text("after\n")
+    (checkout / "generated.js").write_text("validation output\n")
+    context["artifacts"]["workspace_manifest"] = manifest
+    context["artifacts"]["development_report"] = {
+        "repositories_changed": ["repo-1"],
+        "files_changed": ["repo-1/value.txt"],
+    }
+
+    result = manager.commit(context)
+
+    assert "+after" in result["combined_diff"]
+    assert "validation output" not in result["combined_diff"]
+    assert (checkout / "generated.js").read_text() == "generated before\n"
+
+
+def test_commit_rejects_nonignored_untracked_symlink(tmp_path: Path) -> None:
+    _, remote = prepare_local_repository(tmp_path)
+    settings = Settings(_env_file=None, workspace_root=tmp_path / "workspaces", allow_local_git=True)
+    manager = GitWorkspaceManager(settings)
+    context = {
+        "requirement_id": "req-source-symlink",
+        "title": "Unsafe link",
+        "repositories": [{
+            "requirement_repository_id": "link-1",
+            "repository_id": "repo-1",
+            "provider": "github",
+            "full_name": "acme/repo",
+            "clone_url": remote.as_uri(),
+            "target_branch": "main",
+        }],
+        "artifacts": {},
+    }
+    manifest = manager.prepare(context)
+    checkout = Path(manifest["workspace_root"]) / "repo-1"
+    (checkout / "unsafe-link").symlink_to("value.txt")
+    context["artifacts"]["workspace_manifest"] = manifest
+    context["artifacts"]["development_report"] = {"repositories_changed": ["repo-1"]}
+
+    with pytest.raises(GitProviderError, match="symlink"):
+        manager.commit(context)

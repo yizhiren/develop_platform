@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Final
 
 from sqlalchemy import select
@@ -8,9 +9,11 @@ from sqlalchemy.orm import Session
 from ..models.entities import (
     AgentRun,
     ArtifactVersion,
+    ConversationMessage,
     OutboxEvent,
     RepositoryConnection,
     Requirement,
+    RequirementAttachment,
     RequirementRepository,
     RequirementStatus,
     WorkflowTask,
@@ -41,6 +44,7 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
     },
     RequirementStatus.CLARIFYING: {
         "clarification_ready": TransitionRule(RequirementStatus.AWAITING_CLARIFICATION),
+        "clarification_complete": TransitionRule(RequirementStatus.PLANNING, "agent.architect"),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.AWAITING_CLARIFICATION: {
@@ -59,21 +63,40 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.DEVELOPING: {
-        "workspace_ready": TransitionRule(RequirementStatus.DEVELOPING, "agent.develop"),
+        "workspace_ready": TransitionRule(RequirementStatus.DEVELOPING, "dependency.prepare"),
+        "workspace_restored": TransitionRule(RequirementStatus.DEVELOPING, "dependency.prepare"),
+        "dependencies_ready": TransitionRule(RequirementStatus.DEVELOPING, "agent.develop"),
         "development_ready": TransitionRule(RequirementStatus.REVIEWING, "agent.review"),
+        "development_evidence_ready": TransitionRule(
+            RequirementStatus.DEVELOPING,
+            "git.restore_validation_workspace",
+        ),
+        "validation_workspace_restored": TransitionRule(RequirementStatus.REVIEWING, "agent.review"),
+        "changes_committed": TransitionRule(RequirementStatus.REVIEWING, "agent.review"),
         "changes_published": TransitionRule(RequirementStatus.REVIEWING, "agent.review"),
+        "dependency_failed": TransitionRule(RequirementStatus.BLOCKED),
         "automation_failed": TransitionRule(RequirementStatus.BLOCKED),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.REVIEWING: {
         "review_approved": TransitionRule(RequirementStatus.ACCEPTING, "agent.accept"),
         "review_rejected": TransitionRule(RequirementStatus.DEVELOPING, "agent.develop"),
+        "changes_published": TransitionRule(RequirementStatus.ACCEPTING, "git.prepare_verification"),
+        "automation_failed": TransitionRule(RequirementStatus.BLOCKED),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.ACCEPTING: {
-        "verification_ready": TransitionRule(RequirementStatus.ACCEPTING, "agent.accept"),
+        "verification_ready": TransitionRule(
+            RequirementStatus.ACCEPTING,
+            "dependency.prepare_verification",
+        ),
+        "verification_dependencies_ready": TransitionRule(
+            RequirementStatus.ACCEPTING,
+            "agent.accept",
+        ),
         "acceptance_approved": TransitionRule(RequirementStatus.AWAITING_MERGE),
         "acceptance_rejected": TransitionRule(RequirementStatus.REPLANNING, "agent.revise"),
+        "dependency_failed": TransitionRule(RequirementStatus.BLOCKED),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.REPLANNING: {
@@ -90,26 +113,46 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
         "merge_failed": TransitionRule(RequirementStatus.BLOCKED),
     },
     RequirementStatus.REGRESSION: {
-        "incremental_verification_ready": TransitionRule(RequirementStatus.REGRESSION, "agent.regression"),
+        "incremental_verification_ready": TransitionRule(
+            RequirementStatus.REGRESSION,
+            "dependency.prepare_incremental_verification",
+        ),
+        "incremental_verification_dependencies_ready": TransitionRule(
+            RequirementStatus.REGRESSION,
+            "agent.regression",
+        ),
         "regression_passed": TransitionRule(RequirementStatus.AWAITING_MERGE),
         "regression_failed": TransitionRule(RequirementStatus.BLOCKED),
+        "dependency_failed": TransitionRule(RequirementStatus.BLOCKED),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.FINAL_ACCEPTANCE: {
-        "final_verification_ready": TransitionRule(RequirementStatus.FINAL_ACCEPTANCE, "agent.final_accept"),
+        "final_verification_ready": TransitionRule(
+            RequirementStatus.FINAL_ACCEPTANCE,
+            "dependency.prepare_final_verification",
+        ),
+        "final_verification_dependencies_ready": TransitionRule(
+            RequirementStatus.FINAL_ACCEPTANCE,
+            "agent.final_accept",
+        ),
         "final_acceptance_passed": TransitionRule(RequirementStatus.COMPLETED),
         "final_acceptance_failed": TransitionRule(RequirementStatus.BLOCKED),
+        "dependency_failed": TransitionRule(RequirementStatus.BLOCKED),
+        "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.BLOCKED: {
         "retry_development": TransitionRule(RequirementStatus.DEVELOPING, "agent.develop"),
         "retry_planning": TransitionRule(RequirementStatus.REPLANNING, "agent.revise"),
+        "retry_acceptance": TransitionRule(RequirementStatus.ACCEPTING, "git.prepare_verification"),
         "retry_merge": TransitionRule(RequirementStatus.AWAITING_MERGE),
         "retry_regression": TransitionRule(RequirementStatus.REGRESSION, "git.prepare_incremental_verification"),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
 }
 
-PAUSABLE = set(RULES) - {RequirementStatus.BLOCKED}
+PAUSABLE = set(RULES) - {RequirementStatus.BLOCKED, RequirementStatus.MERGING}
+
+
 def transition_requirement(
     session: Session,
     requirement: Requirement,
@@ -126,9 +169,34 @@ def transition_requirement(
         )
 
     current = RequirementStatus(requirement.status)
+    previous_development_failure = (
+        _latest_development_failure(session, requirement.id)
+        if current == RequirementStatus.BLOCKED and event == "retry_development"
+        else {}
+    )
+    if current == RequirementStatus.AWAITING_CLARIFICATION and event == "request_more_clarification" and not reason.strip():
+        raise WorkflowError("clarification feedback is required")
+    if current == RequirementStatus.AWAITING_PLAN and event == "request_plan_change" and not reason.strip():
+        raise WorkflowError("architecture plan feedback is required")
+    if event == "cancel" and not reason.strip():
+        raise WorkflowError("closing reason is required")
+    if current == RequirementStatus.AWAITING_CLARIFICATION and event == "confirm_clarification":
+        clarification = session.scalar(
+            select(ArtifactVersion)
+            .where(
+                ArtifactVersion.requirement_id == requirement.id,
+                ArtifactVersion.kind == "clarification_spec",
+            )
+            .order_by(ArtifactVersion.version.desc())
+        )
+        if clarification and json.loads(clarification.content_json).get("open_questions"):
+            raise WorkflowError("clarification still has open questions")
     if event == "pause" and current in PAUSABLE:
         requirement.paused_from = current.value
         rule = TransitionRule(RequirementStatus.PAUSED)
+    elif current == RequirementStatus.PAUSED and event == "cancel":
+        rule = TransitionRule(RequirementStatus.CANCELLED)
+        requirement.paused_from = None
     elif current == RequirementStatus.PAUSED and event == "resume" and requirement.paused_from:
         rule = TransitionRule(RequirementStatus(requirement.paused_from))
         requirement.paused_from = None
@@ -145,14 +213,48 @@ def transition_requirement(
 
     settings = get_settings()
     if settings.repository_automation_enabled:
-        if current == RequirementStatus.AWAITING_CLARIFICATION and event == "confirm_clarification":
+        if current == RequirementStatus.CLARIFYING and event == "clarification_complete":
+            rule = TransitionRule(RequirementStatus.PLANNING, "git.prepare_analysis")
+        elif current == RequirementStatus.AWAITING_CLARIFICATION and event == "confirm_clarification":
             rule = TransitionRule(RequirementStatus.PLANNING, "git.prepare_analysis")
         elif current == RequirementStatus.AWAITING_PLAN and event == "confirm_plan":
             rule = TransitionRule(RequirementStatus.DEVELOPING, "git.prepare_workspaces")
+        elif current == RequirementStatus.REPLANNING and event == "revision_ready":
+            workspace_task = (
+                "git.restore_workspaces"
+                if _has_artifact(session, requirement.id, "workspace_manifest")
+                else "git.prepare_workspaces"
+            )
+            rule = TransitionRule(RequirementStatus.DEVELOPING, workspace_task)
+        elif (
+            current == RequirementStatus.BLOCKED
+            and event == "retry_development"
+            and not _has_artifact(session, requirement.id, "workspace_manifest")
+        ):
+            rule = TransitionRule(RequirementStatus.DEVELOPING, "git.prepare_workspaces")
+        elif current == RequirementStatus.BLOCKED and event == "retry_development":
+            rule = TransitionRule(
+                RequirementStatus.DEVELOPING,
+                "dependency.prepare"
+                if previous_development_failure.get("changed_paths")
+                else "git.restore_workspaces",
+            )
+        elif current == RequirementStatus.REVIEWING and event == "review_rejected":
+            workspace_task = (
+                "git.restore_workspaces"
+                if _has_artifact(session, requirement.id, "workspace_manifest")
+                else "git.prepare_workspaces"
+            )
+            rule = TransitionRule(RequirementStatus.DEVELOPING, workspace_task)
         elif current == RequirementStatus.DEVELOPING and event == "development_ready":
-            rule = TransitionRule(RequirementStatus.DEVELOPING, "git.publish_changes")
+            rule = TransitionRule(RequirementStatus.DEVELOPING, "git.commit_changes")
+        elif current == RequirementStatus.DEVELOPING and event == "development_evidence_ready":
+            rule = TransitionRule(
+                RequirementStatus.DEVELOPING,
+                "git.restore_validation_workspace",
+            )
         elif current == RequirementStatus.REVIEWING and event == "review_approved":
-            rule = TransitionRule(RequirementStatus.ACCEPTING, "git.prepare_verification")
+            rule = TransitionRule(RequirementStatus.REVIEWING, "git.publish_changes")
         elif current == RequirementStatus.MERGING and event == "all_repositories_merged":
             rule = TransitionRule(RequirementStatus.FINAL_ACCEPTANCE, "git.prepare_final_verification")
         elif current == RequirementStatus.MERGING and event == "repository_merged":
@@ -168,8 +270,38 @@ def transition_requirement(
         if requirement.acceptance_failures >= 3:
             rule = TransitionRule(RequirementStatus.BLOCKED)
             reason = reason or "acceptance failed three times"
+    if current == RequirementStatus.BLOCKED and event == "retry_development":
+        requirement.review_failures = 0
+    elif current == RequirementStatus.BLOCKED and event == "retry_planning":
+        requirement.review_failures = 0
+        requirement.acceptance_failures = 0
+    elif current == RequirementStatus.BLOCKED and event == "retry_acceptance":
+        requirement.acceptance_failures = 0
 
     previous = requirement.status
+    if (
+        (
+            current == RequirementStatus.AWAITING_CLARIFICATION
+            and event == "request_more_clarification"
+        )
+        or (
+            current == RequirementStatus.AWAITING_PLAN
+            and event == "request_plan_change"
+        )
+    ) and (
+        actor_type == "user"
+        and reason.strip()
+    ):
+        session.add(
+            ConversationMessage(
+                requirement_id=requirement.id,
+                author_type="user",
+                author_id=actor_id,
+                stage=current.value,
+                body=reason.strip(),
+            )
+        )
+        session.flush()
     requirement.status = rule.target.value
     requirement.version += 1
     transition = WorkflowTransition(
@@ -183,10 +315,28 @@ def transition_requirement(
     )
     session.add(transition)
 
+    if event == "cancel":
+        requirement.paused_from = None
+        _cancel_pending_work(session, requirement.id, reason.strip())
+
     task = None
     if rule.task_type:
         role = rule.task_type.split(".", 1)[1] if rule.task_type.startswith("agent.") else None
         context = _build_task_context(session, requirement)
+        if previous_development_failure:
+            context["_previous_attempt_failure"] = previous_development_failure
+        if role == "review":
+            # A previous rejection is feedback for the developer, not evidence for
+            # the next independent review. Keeping it here anchors the reviewer on
+            # stale findings even when the latest commit manifest proves otherwise.
+            context["artifacts"].pop("code_review_report", None)
+            context["review_stage_policy"] = {
+                "stage": "pre_publish",
+                "publication_occurs_after_approval": True,
+                "missing_push_is_not_a_review_finding": True,
+                "remote_verification_owner": "trusted_git_worker_and_acceptance",
+                "format_consistency_means": "preserve Markdown structure and style while allowing required content changes",
+            }
         if task_context:
             context.update(task_context)
         agent_run = None
@@ -230,13 +380,100 @@ def transition_requirement(
     return task
 
 
+def _cancel_pending_work(
+    session: Session,
+    requirement_id: str,
+    reason: str,
+) -> None:
+    """Make queued/in-flight work inert while retaining its audit history."""
+    now = datetime.now(UTC)
+    tasks = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement_id,
+            WorkflowTask.status.in_({"queued", "running"}),
+        )
+    ).all()
+    task_ids = {task.id for task in tasks}
+    for task in tasks:
+        task.status = "cancelled"
+        task.lease_owner = None
+        task.lease_expires_at = None
+        if task.agent_run_id:
+            run = session.get(AgentRun, task.agent_run_id)
+            if run and run.status in {"queued", "running"}:
+                run.status = "cancelled"
+                run.error_code = "requirement.cancelled"
+                run.error_message = reason
+                run.completed_at = now
+
+    if not task_ids:
+        return
+    events = session.scalars(
+        select(OutboxEvent).where(
+            OutboxEvent.aggregate_id == requirement_id,
+            OutboxEvent.published.is_(False),
+        )
+    ).all()
+    for event in events:
+        try:
+            event_task_id = json.loads(event.payload_json).get("task_id")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if event_task_id in task_ids:
+            event.published = True
+            event.published_at = now
+
+
+def _has_artifact(session: Session, requirement_id: str, kind: str) -> bool:
+    return session.scalar(
+        select(ArtifactVersion.id)
+        .where(
+            ArtifactVersion.requirement_id == requirement_id,
+            ArtifactVersion.kind == kind,
+        )
+        .limit(1)
+    ) is not None
+
+
+def _latest_development_failure(session: Session, requirement_id: str) -> dict:
+    tasks = session.scalars(
+        select(WorkflowTask)
+        .where(
+            WorkflowTask.requirement_id == requirement_id,
+            WorkflowTask.task_type == "agent.develop",
+            WorkflowTask.status == "failed",
+        )
+        .order_by(WorkflowTask.created_at.desc(), WorkflowTask.id.desc())
+    ).all()
+    for task in tasks:
+        try:
+            failure = json.loads(task.payload_json).get("_failure")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(failure, dict):
+            return {
+                "error_code": str(failure.get("error_code") or "")[:80],
+                "error_message": str(failure.get("error_message") or "")[:3_800],
+                "changed_paths": [
+                    str(path)[:1_000]
+                    for path in failure.get("changed_paths", [])[:200]
+                    if isinstance(path, str)
+                ]
+                if isinstance(failure.get("changed_paths"), list)
+                else [],
+            }
+    return {}
+
+
 def _build_task_context(session: Session, requirement: Requirement) -> dict:
     context: dict = {
         "requirement_id": requirement.id,
         "title": requirement.title,
         "description": requirement.description,
         "repositories": [],
+        "attachments": [],
         "artifacts": {},
+        "conversation": [],
     }
     repository_rows = session.execute(
         select(RequirementRepository, RepositoryConnection)
@@ -261,6 +498,22 @@ def _build_task_context(session: Session, requirement: Requirement) -> dict:
         }
         for link, repository in repository_rows
     ]
+    attachments = session.scalars(
+        select(RequirementAttachment)
+        .where(RequirementAttachment.requirement_id == requirement.id)
+        .order_by(RequirementAttachment.created_at, RequirementAttachment.id)
+    ).all()
+    context["attachments"] = [
+        {
+            "id": attachment.id,
+            "filename": attachment.filename,
+            "media_type": attachment.media_type,
+            "path": attachment.path,
+            "sha256": attachment.sha256,
+            "size_bytes": attachment.size_bytes,
+        }
+        for attachment in attachments
+    ]
     artifacts = session.scalars(
         select(ArtifactVersion)
         .where(ArtifactVersion.requirement_id == requirement.id)
@@ -269,4 +522,18 @@ def _build_task_context(session: Session, requirement: Requirement) -> dict:
     for artifact in artifacts:
         if artifact.kind not in context["artifacts"]:
             context["artifacts"][artifact.kind] = json.loads(artifact.content_json)
+    messages = session.scalars(
+        select(ConversationMessage)
+        .where(ConversationMessage.requirement_id == requirement.id)
+        .order_by(ConversationMessage.created_at)
+    ).all()
+    context["conversation"] = [
+        {
+            "author_type": message.author_type,
+            "stage": message.stage,
+            "body": message.body,
+            "created_at": message.created_at.isoformat(),
+        }
+        for message in messages
+    ]
     return context
