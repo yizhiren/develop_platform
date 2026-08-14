@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from app.agents.acceptance import AcceptanceToolLoop
+from app.agents.acceptance import AcceptanceToolLoop, _command_completed_successfully
 from app.agents.providers import FakeLLMProvider, LLMProvider, ModelImage, ModelResponse
 
 
@@ -22,6 +22,12 @@ class ScriptedProvider(LLMProvider):
             completion_tokens=5,
             model="scripted-acceptance",
         )
+
+
+def test_search_no_match_is_a_successful_acceptance_observation() -> None:
+    assert _command_completed_successfully(["rg", "obsolete-symbol"], 1) is True
+    assert _command_completed_successfully(["grep", "-R", "obsolete-symbol", "."], 1) is True
+    assert _command_completed_successfully(["rg", "obsolete-symbol"], 2) is False
 
 
 class ImageScriptedProvider(ScriptedProvider):
@@ -143,7 +149,7 @@ async def test_acceptance_agent_independently_inspects_tests_and_covers_every_cr
         "agent4-test-2",
     }
     assert report.environment["workspace"] == "clean_sha_verified_checkout"
-    assert report.environment["network"] == "disabled"
+    assert report.environment["network"] == "enabled"
     assert not any(item.get("workspace_integrity_violations") for item in report.regression_results)
     assert response.model == "scripted-acceptance"
     assert "verification_method" in provider.systems[0]
@@ -265,16 +271,97 @@ async def test_acceptance_agent_does_not_let_blocked_should_criterion_veto_passe
                 "criterion_ids": ["AC-must"],
             },
             {"action": "finish", "report": rejected},
-            {"action": "finish", "report": {**rejected, "approved": True}},
         ]
     )
 
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path, criteria))
 
     assert report.approved is True
-    assert provider.users[2]["observation"]["type"] == "error"
-    assert "blocked should criteria" in " ".join(provider.users[2]["observation"]["issues"])
+    assert len(provider.users) == 2
+    assert "平台门禁确认" in report.summary
     assert "should 项 blocked 不得阻止 approved=true" in provider.systems[0]
+
+
+@pytest.mark.asyncio
+async def test_acceptance_agent_repairs_platform_known_evidence_links(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    (repository / "value.py").write_text("VALUE = 1\n")
+    provider = ScriptedProvider(
+        [
+            {
+                "action": "run_command",
+                "argv": ["python", "-c", "assert 1 + 1 == 2"],
+                "cwd": "repo-1",
+                "criterion_ids": ["AC-1", "AC-2"],
+            },
+            {
+                "action": "finish",
+                "report": {
+                    "approved": True,
+                    "summary": "The checks passed, but evidence ids were copied incorrectly.",
+                    "criteria": [
+                        {
+                            "criterion_id": "AC-1",
+                            "status": "passed",
+                            "summary": "Checked independently.",
+                            "evidence_paths": ["hallucinated-id"],
+                        },
+                        {
+                            "criterion_id": "AC-2",
+                            "status": "passed",
+                            "summary": "Checked independently.",
+                            "evidence_paths": [],
+                        },
+                    ],
+                    "regression_results": [],
+                    "environment": {},
+                },
+            },
+        ]
+    )
+
+    report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path))
+
+    assert report.approved is True
+    assert report.criteria[0].evidence_paths == ["agent4-test-1"]
+    assert report.criteria[1].evidence_paths == ["agent4-test-1"]
+
+
+@pytest.mark.asyncio
+async def test_acceptance_agent_falls_back_to_platform_report_after_repeated_invalid_finish(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    (repository / "value.py").write_text("VALUE = 1\n")
+    invalid_report = {
+        "approved": False,
+        "summary": "The model omitted the confirmed acceptance criteria.",
+        "criteria": [],
+        "regression_results": [],
+        "environment": {},
+    }
+    provider = ScriptedProvider(
+        [
+            {
+                "action": "run_command",
+                "argv": ["python", "-c", "assert 1 + 1 == 2"],
+                "cwd": "repo-1",
+                "criterion_ids": ["AC-1", "AC-2"],
+            },
+            {"action": "finish", "report": invalid_report},
+            {"action": "finish", "report": invalid_report},
+        ]
+    )
+
+    report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path))
+
+    assert report.approved is True
+    assert len(provider.users) == 3
+    assert report.summary.startswith("Platform evidence gate approved")
+    assert {item.criterion_id for item in report.criteria} == {"AC-1", "AC-2"}
+    assert all(item.evidence_paths == ["agent4-test-1"] for item in report.criteria)
 
 
 @pytest.mark.asyncio

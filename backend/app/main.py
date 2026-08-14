@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -86,6 +87,13 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 login_throttle = LoginThrottle()
 provider_secret_store = ProviderSecretStore(settings.provider_secret_root)
+
+
+def _utc_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return aware.isoformat().replace("+00:00", "Z")
 
 
 def provider_api_enabled(provider: str) -> bool:
@@ -853,7 +861,7 @@ def get_requirement_task(
     task_id: str,
     session: Session = Depends(get_db),
     user: User = Depends(current_user),
-) -> dict[str, str | None]:
+) -> dict[str, Any]:
     get_requirement(requirement_id, session, user)
     task = session.get(WorkflowTask, task_id)
     if task is None or task.requirement_id != requirement_id:
@@ -878,6 +886,7 @@ def get_requirement_task(
         "status": effective_task.status,
         "error_code": failure.get("error_code"),
         "error_message": failure.get("error_message"),
+        "diagnostics": failure.get("diagnostics") or {},
     }
 
 
@@ -899,7 +908,7 @@ def list_requirement_tasks(
             "agent_run_id": task.agent_run_id,
             "task_type": task.task_type,
             "status": task.status,
-            "created_at": task.created_at,
+            "created_at": _utc_iso(task.created_at),
         }
         for task in tasks
     ]
@@ -947,13 +956,13 @@ def transition(
     human_events = {
         "publish", "cancel", "pause", "resume", "confirm_clarification",
         "request_more_clarification", "confirm_plan", "request_plan_change",
-        "begin_merge", "retry_development", "retry_planning", "retry_acceptance", "retry_merge", "retry_regression",
+        "begin_merge", "retry_clarification", "retry_development", "retry_review", "retry_planning", "retry_acceptance", "retry_merge", "retry_regression",
     }
     if payload.event not in human_events:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "event is reserved for an internal worker")
     if payload.event == "cancel" and user.id != requirement.owner_id:
         require_project_role(session, user, project, {ProjectRole.OWNER})
-    owner_only = {"confirm_clarification", "confirm_plan", "begin_merge", "retry_development", "retry_planning", "retry_acceptance", "retry_merge", "retry_regression"}
+    owner_only = {"confirm_clarification", "confirm_plan", "begin_merge", "retry_clarification", "retry_development", "retry_review", "retry_planning", "retry_acceptance", "retry_merge", "retry_regression"}
     if payload.event in owner_only:
         require_project_role(session, user, project, {ProjectRole.OWNER})
     task_context = None
@@ -1007,7 +1016,7 @@ def list_artifacts(
     requirement = get_requirement(requirement_id, session, user)
     del requirement
     artifacts = session.scalars(select(ArtifactVersion).where(ArtifactVersion.requirement_id == requirement_id).order_by(ArtifactVersion.created_at)).all()
-    return [{"id": item.id, "kind": item.kind, "version": item.version, "schema_version": item.schema_version, "content": json.loads(item.content_json), "markdown": item.content_markdown, "created_at": item.created_at} for item in artifacts]
+    return [{"id": item.id, "kind": item.kind, "version": item.version, "schema_version": item.schema_version, "content": json.loads(item.content_json), "markdown": item.content_markdown, "created_at": _utc_iso(item.created_at)} for item in artifacts]
 
 
 @app.get("/api/v1/requirements/{requirement_id}/evidence")
@@ -1026,7 +1035,7 @@ def list_evidence(
             "kind": item.kind,
             "sha256": item.sha256,
             "size_bytes": item.size_bytes,
-            "created_at": item.created_at,
+            "created_at": _utc_iso(item.created_at),
         }
         for item in items
     ]
@@ -1061,7 +1070,7 @@ def timeline(
 ) -> list[dict]:
     get_requirement(requirement_id, session, user)
     transitions = session.scalars(select(WorkflowTransition).where(WorkflowTransition.requirement_id == requirement_id).order_by(WorkflowTransition.created_at)).all()
-    return [{"id": item.id, "from_status": item.from_status, "to_status": item.to_status, "event": item.event, "actor_type": item.actor_type, "actor_id": item.actor_id, "reason": item.reason, "created_at": item.created_at} for item in transitions]
+    return [{"id": item.id, "from_status": item.from_status, "to_status": item.to_status, "event": item.event, "actor_type": item.actor_type, "actor_id": item.actor_id, "reason": item.reason, "created_at": _utc_iso(item.created_at)} for item in transitions]
 
 
 @app.get("/api/v1/requirements/{requirement_id}/agent-runs")
@@ -1085,8 +1094,9 @@ def list_agent_runs(
             "token_usage": run.token_usage,
             "error_code": run.error_code,
             "error_message": run.error_message,
-            "created_at": run.created_at,
-            "completed_at": run.completed_at,
+            "diagnostics": json.loads(run.diagnostics_json or "{}"),
+            "created_at": _utc_iso(run.created_at),
+            "completed_at": _utc_iso(run.completed_at),
         }
         for run in runs
     ]
@@ -1101,7 +1111,7 @@ def list_audit_events(
     require_admin(user)
     safe_limit = min(max(limit, 1), 500)
     items = session.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(safe_limit)).all()
-    return [{"id": item.id, "actor_id": item.actor_id, "action": item.action, "resource_type": item.resource_type, "resource_id": item.resource_id, "details": json.loads(item.details_json), "created_at": item.created_at} for item in items]
+    return [{"id": item.id, "actor_id": item.actor_id, "action": item.action, "resource_type": item.resource_type, "resource_id": item.resource_id, "details": json.loads(item.details_json), "created_at": _utc_iso(item.created_at)} for item in items]
 
 
 @app.get("/api/v1/events")

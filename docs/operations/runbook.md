@@ -68,7 +68,9 @@ HOST_SSH_DIR=/Users/your-name/.ssh
 
 第一条命令会启动一次性消费者、读取专用测试消息后对其发送 `SIGKILL`，再由替代消费者通过 `XAUTOCLAIM` 接管并确认；它只操作带随机后缀的演练 Stream。第二条命令验证全局需求并发上限的阻塞与释放，不操作业务需求。
 
-Sandbox Executor 由 Compose 常驻启动并使用 `network_mode: none`。诊断时应同时检查 `agent-worker` 与 `sandbox-executor` 日志和 `/runtime/sandbox.sock`，不要临时给执行器增加 Docker Socket、数据库 Volume 或 Provider/模型密钥。
+Sandbox Executor 由 Compose 常驻启动并连接独立公网出口网络。诊断时应同时检查 `agent-worker` 与 `sandbox-executor` 日志和 `/runtime/sandbox.sock`；不要把执行器接入应用内部网络，也不要增加 Docker Socket、数据库 Volume 或 Provider/模型密钥。
+
+Sandbox 的实际内存由容器级 `SANDBOX_EXECUTOR_MEMORY_LIMIT` 统一约束，默认 `6g`。不要对子进程设置较小的 `RLIMIT_AS`：Node/WebAssembly 会预留较大的虚拟地址空间，即使常驻内存不高也可能被误判为 OOM。调整该值后需替换 `sandbox-executor`。
 
 ## 故障顺序
 

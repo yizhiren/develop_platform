@@ -22,9 +22,14 @@ SECRET_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
 ]
 ANALYSIS_FILENAMES = {
+    ".gitlab-ci.yml",
+    "jenkinsfile",
+    "makefile",
     "package.json",
     "pyproject.toml",
+    "pytest.ini",
     "requirements.txt",
+    "tox.ini",
     "go.mod",
     "cargo.toml",
     "pom.xml",
@@ -54,6 +59,9 @@ class GitWorkspaceManager:
     def prepare(self, context: dict[str, Any]) -> dict[str, Any]:
         requirement_id = _safe_id(context["requirement_id"])
         self.cleanup_stale()
+        analysis_workspace_id = _safe_id(f"{requirement_id}-analysis")
+        shutil.rmtree(self.root / analysis_workspace_id, ignore_errors=True)
+        self._lease_path(analysis_workspace_id).unlink(missing_ok=True)
         requirement_root = self.root / requirement_id
         requirement_root.mkdir(parents=True, exist_ok=True)
         manifests: list[dict[str, Any]] = []
@@ -135,6 +143,7 @@ class GitWorkspaceManager:
         analysis_root.mkdir(parents=True)
         snapshots: list[dict[str, Any]] = []
         remaining_content_bytes = 100_000
+        path_hints = _analysis_path_hints(context)
         try:
             for repository in context.get("repositories", []):
                 repository_id = _safe_id(repository["repository_id"])
@@ -150,7 +159,11 @@ class GitWorkspaceManager:
                 )
                 self._run(["git", "config", "core.hooksPath", "/dev/null"], target, env)
                 head_sha = self._run(["git", "rev-parse", "HEAD"], target, env).strip()
-                snapshot, used = _repository_analysis_snapshot(target, remaining_content_bytes)
+                snapshot, used = _repository_analysis_snapshot(
+                    target,
+                    remaining_content_bytes,
+                    path_hints,
+                )
                 remaining_content_bytes -= used
                 snapshots.append(
                     {
@@ -160,6 +173,7 @@ class GitWorkspaceManager:
                         "full_name": repository["full_name"],
                         "target_branch": repository["target_branch"],
                         "head_sha": head_sha,
+                        "relative_path": repository_id,
                         **snapshot,
                     }
                 )
@@ -173,6 +187,7 @@ class GitWorkspaceManager:
         return {
             "schema_version": "1.0",
             "source": "trusted_read_only_checkout",
+            "workspace_root": str(analysis_root),
             "repositories": snapshots,
         }
 
@@ -394,6 +409,7 @@ class GitWorkspaceManager:
                     repository_root,
                     env,
                     _repository_changed_paths(context, item),
+                    trusted_base=_repository_committed_state(context, item),
                 )
                 status = self._run(["git", "status", "--porcelain=v1"], trusted_root, env)
                 if not status.strip():
@@ -568,6 +584,7 @@ class GitWorkspaceManager:
         developer_root: Path,
         env: dict[str, str],
         changed_paths: set[Path] | None = None,
+        trusted_base: dict[str, Any] | None = None,
     ) -> Path:
         target = self.publishing / requirement_id / manifest_item["repository_id"]
         shutil.rmtree(target, ignore_errors=True)
@@ -591,8 +608,79 @@ class GitWorkspaceManager:
         self._run(["git", "config", "user.name", "画板 Developer Agent"], target, env)
         self._run(["git", "config", "user.email", "agent@huaban.local"], target, env)
         self._run(["git", "checkout", "-B", manifest_item["work_branch"]], target, env)
+        if trusted_base is not None:
+            self._restore_trusted_commit_base(
+                target,
+                developer_root,
+                manifest_item,
+                trusted_base,
+                env,
+            )
         _sync_untrusted_worktree(developer_root, target, changed_paths)
         return target
+
+    def _restore_trusted_commit_base(
+        self,
+        target: Path,
+        developer_root: Path,
+        manifest_item: dict[str, Any],
+        trusted_base: dict[str, Any],
+        env: dict[str, str],
+    ) -> None:
+        """Rebuild an unpublished reviewed commit before applying the next rework diff."""
+        expected_head = str(trusted_base.get("head_sha") or "").strip()
+        expected_baseline = str(trusted_base.get("baseline_sha") or "").strip()
+        expected_diff_sha = str(trusted_base.get("diff_sha256") or "").strip()
+        if (
+            not expected_head
+            or expected_baseline != str(manifest_item.get("baseline_sha") or "")
+            or len(expected_diff_sha) != 64
+        ):
+            raise GitProviderError(
+                "git.commit_manifest_invalid",
+                "prior reviewed commit metadata is incomplete or has a different baseline",
+            )
+
+        current_head = self._run(["git", "rev-parse", "HEAD"], target, env).strip()
+        if current_head != expected_head:
+            self._run(
+                ["git", "cat-file", "-e", f"{expected_head}^{{commit}}"],
+                developer_root,
+                env,
+            )
+            source_diff = self._run(
+                ["git", "diff", "--no-ext-diff", f"{expected_baseline}..{expected_head}"],
+                developer_root,
+                env,
+                max_bytes=500_000,
+            )
+            if hashlib.sha256(source_diff.encode()).hexdigest() != expected_diff_sha:
+                raise GitProviderError(
+                    "git.diff_mismatch",
+                    "prior reviewed commit no longer matches its trusted evidence",
+                )
+            self._run(
+                ["git", "fetch", "--no-tags", "--", str(developer_root), expected_head],
+                target,
+                env,
+            )
+            self._run(
+                ["git", "checkout", "-B", manifest_item["work_branch"], expected_head],
+                target,
+                env,
+            )
+
+        target_diff = self._run(
+            ["git", "diff", "--no-ext-diff", f"{expected_baseline}..{expected_head}"],
+            target,
+            env,
+            max_bytes=500_000,
+        )
+        if hashlib.sha256(target_diff.encode()).hexdigest() != expected_diff_sha:
+            raise GitProviderError(
+                "git.diff_mismatch",
+                "restored reviewed commit does not match its trusted evidence",
+            )
 
     def cleanup_stale(self, now: float | None = None) -> list[str]:
         cutoff = (now if now is not None else time.time()) - self.settings.workspace_ttl_hours * 3600
@@ -749,6 +837,24 @@ def _repository_changed_paths(
     return selected
 
 
+def _repository_committed_state(
+    context: dict[str, Any],
+    manifest_item: dict[str, Any],
+) -> dict[str, Any] | None:
+    committed = context.get("artifacts", {}).get("development_commit_manifest")
+    if not isinstance(committed, dict):
+        return None
+    repository_id = str(manifest_item.get("repository_id") or "")
+    return next(
+        (
+            item
+            for item in committed.get("repositories", [])
+            if isinstance(item, dict) and str(item.get("repository_id") or "") == repository_id
+        ),
+        None,
+    )
+
+
 def _sync_untrusted_worktree(
     source: Path,
     destination: Path,
@@ -900,12 +1006,27 @@ def _trusted_ignored_paths(repository: Path, paths: list[Path]) -> set[Path]:
     }
 
 
-def _repository_analysis_snapshot(root: Path, content_budget: int) -> tuple[dict[str, Any], int]:
+def _analysis_path_hints(context: dict[str, Any]) -> set[str]:
+    requirement_text = f"{context.get('title', '')}\n{context.get('description', '')}"
+    candidates = re.findall(
+        r"(?:[A-Za-z0-9_.@+-]+/)*[A-Za-z0-9_.@+-]+\.[A-Za-z0-9]{1,10}",
+        requirement_text,
+    )
+    return {candidate.lower() for candidate in candidates if len(candidate) <= 240}
+
+
+def _repository_analysis_snapshot(
+    root: Path,
+    content_budget: int,
+    path_hints: set[str] | None = None,
+) -> tuple[dict[str, Any], int]:
     tree: list[str] = []
     selected: list[dict[str, str]] = []
     extension_counts: dict[str, int] = {}
     used = 0
-    candidates: list[Path] = []
+    targeted_candidates: list[Path] = []
+    baseline_candidates: list[Path] = []
+    path_hints = path_hints or set()
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if ".git" in relative.parts or path.is_symlink() or not path.is_file():
@@ -916,12 +1037,36 @@ def _repository_analysis_snapshot(root: Path, content_budget: int) -> tuple[dict
         suffix = path.suffix.lower() or "[none]"
         extension_counts[suffix] = extension_counts.get(suffix, 0) + 1
         lowered = path.name.lower()
-        if (
+        lowered_relative = relative_name.lower()
+        is_requested_path = any(
+            lowered_relative == hint
+            or lowered_relative.endswith(f"/{hint}")
+            or hint in lowered_relative
+            for hint in path_hints
+        )
+        is_ci_configuration = (
+            len(relative.parts) >= 3
+            and relative.parts[0].lower() == ".github"
+            and relative.parts[1].lower() == "workflows"
+            and path.suffix.lower() in {".yml", ".yaml"}
+        ) or (
+            len(relative.parts) >= 2
+            and relative.parts[0].lower() == ".circleci"
+            and lowered in {"config.yml", "config.yaml"}
+        )
+        is_baseline_context = (
             lowered.startswith("readme")
             or lowered in ANALYSIS_FILENAMES
+            or (lowered.startswith("tsconfig") and path.suffix.lower() == ".json")
             or (relative.parts and relative.parts[0].lower() in {"docs", "architecture"} and suffix == ".md")
-        ):
-            candidates.append(path)
+            or is_ci_configuration
+        )
+        if is_requested_path:
+            targeted_candidates.append(path)
+        elif is_baseline_context:
+            baseline_candidates.append(path)
+    candidates = list(dict.fromkeys([*targeted_candidates, *baseline_candidates]))
+    targeted = set(targeted_candidates)
     for path in candidates[:30]:
         if used >= content_budget:
             break
@@ -933,7 +1078,13 @@ def _repository_analysis_snapshot(root: Path, content_budget: int) -> tuple[dict
         remaining = min(12_000, content_budget - used)
         content = data[:remaining].decode("utf-8", errors="replace")
         used += len(content.encode("utf-8"))
-        selected.append({"path": path.relative_to(root).as_posix(), "content": content})
+        selected.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "content": content,
+                "selection_reason": "requirement_reference" if path in targeted else "repository_baseline",
+            }
+        )
     return {
         "file_tree": tree,
         "file_tree_truncated": len(tree) >= 800,

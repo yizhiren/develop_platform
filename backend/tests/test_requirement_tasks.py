@@ -74,5 +74,6 @@ def test_requirement_task_list_exposes_active_platform_and_agent_work() -> None:
     assert by_id[platform_task.id]["agent_run_id"] is None
     assert by_id[platform_task.id]["task_type"] == "dependency.prepare"
     assert by_id[platform_task.id]["status"] == "running"
+    assert by_id[platform_task.id]["created_at"].endswith("Z")
     assert by_id[agent_task.id]["agent_run_id"] == run.id
     assert by_id[agent_task.id]["status"] == "queued"

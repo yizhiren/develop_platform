@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -79,6 +80,55 @@ def complete_scoped_dependency_preparation(
     return task
 
 
+def complete_architecture_at_confidence(
+    session: Session,
+    requirement: Requirement,
+    monkeypatch,
+    confidence: int | None,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        repository_automation_enabled=False,
+        architecture_auto_approve_confidence_threshold=90,
+        llm_provider="fake",
+    )
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
+    clarifier = transition_requirement(
+        session,
+        requirement,
+        "publish",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+    process_task_result(
+        session,
+        {
+            "task_id": clarifier.id,
+            "status": "completed",
+            "output": {"summary": "需求信息已经完整", "open_questions": []},
+        },
+    )
+    architect = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.architect",
+        )
+    ).one()
+    output = {"summary": "方案可以实施", "target_architecture": "保持现有模块边界"}
+    if confidence is not None:
+        output["confidence"] = confidence
+    process_task_result(
+        session,
+        {
+            "task_id": architect.id,
+            "status": "completed",
+            "output": output,
+        },
+    )
+
+
 def test_happy_path_schedules_clarifier() -> None:
     session, requirement = session_with_requirement()
     task = transition_requirement(session, requirement, "publish", 1, "user", requirement.owner_id)
@@ -86,6 +136,195 @@ def test_happy_path_schedules_clarifier() -> None:
     assert requirement.version == 2
     assert task is not None and task.task_type == "agent.clarify"
     assert session.get(AgentRun, task.agent_run_id).agent_key == "agent1"
+
+
+def test_repository_analysis_precedes_clarifier_and_is_reused_for_architect(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    repository = RepositoryConnection(
+        project_id=requirement.project_id,
+        provider="github",
+        external_id="clarifier-analysis-1",
+        full_name="acme/analyzed-before-clarification",
+        clone_url="https://github.com/acme/analyzed-before-clarification.git",
+        web_url="https://github.com/acme/analyzed-before-clarification",
+    )
+    session.add(repository)
+    session.flush()
+    session.add(
+        RequirementRepository(
+            requirement_id=requirement.id,
+            repository_id=repository.id,
+            target_branch="main",
+        )
+    )
+    session.flush()
+    settings = Settings(
+        _env_file=None,
+        repository_automation_enabled=True,
+        llm_provider="fake",
+    )
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
+
+    analysis_task = transition_requirement(
+        session,
+        requirement,
+        "publish",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.CLARIFYING
+    assert analysis_task is not None
+    assert analysis_task.task_type == "git.prepare_analysis"
+    assert analysis_task.agent_run_id is None
+    assert not session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.clarify",
+        )
+    ).all()
+
+    repository_analysis = {
+        "source": "trusted_read_only_checkout",
+        "repositories": [
+            {
+                "repository_id": repository.id,
+                "head_sha": "abc123",
+                "file_tree": ["package.json", ".github/workflows/ci.yml"],
+                "file_type_counts": {".ts": 12},
+                "selected_files": [
+                    {"path": "package.json", "content": '{"scripts":{"test":"npm test"}}'}
+                ],
+            }
+        ],
+    }
+    process_task_result(
+        session,
+        {
+            "task_id": analysis_task.id,
+            "status": "completed",
+            "output": repository_analysis,
+        },
+    )
+
+    clarifier_task = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.clarify",
+        )
+    ).one()
+    clarifier_context = json.loads(clarifier_task.payload_json)["context"]
+    assert requirement.status == RequirementStatus.CLARIFYING
+    assert clarifier_context["artifacts"]["repository_analysis"] == repository_analysis
+    assert clarifier_context["repositories"][0]["repository_id"] == repository.id
+
+    process_task_result(
+        session,
+        {
+            "task_id": clarifier_task.id,
+            "status": "completed",
+            "output": {"summary": "仓库与需求信息充分", "open_questions": []},
+        },
+    )
+
+    architect_task = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.architect",
+        )
+    ).one()
+    architect_context = json.loads(architect_task.payload_json)["context"]
+    assert requirement.status == RequirementStatus.PLANNING
+    assert architect_context["artifacts"]["repository_analysis"] == repository_analysis
+    assert len(
+        session.scalars(
+            select(WorkflowTask).where(
+                WorkflowTask.requirement_id == requirement.id,
+                WorkflowTask.task_type == "git.prepare_analysis",
+            )
+        ).all()
+    ) == 1
+
+
+def test_legacy_clarification_reply_prepares_missing_repository_analysis(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    repository = RepositoryConnection(
+        project_id=requirement.project_id,
+        provider="github",
+        external_id="legacy-clarifier-analysis-1",
+        full_name="acme/legacy-clarification",
+        clone_url="https://github.com/acme/legacy-clarification.git",
+        web_url="https://github.com/acme/legacy-clarification",
+    )
+    session.add(repository)
+    session.flush()
+    session.add(
+        RequirementRepository(
+            requirement_id=requirement.id,
+            repository_id=repository.id,
+            target_branch="main",
+        )
+    )
+    session.add(
+        ArtifactVersion(
+            requirement_id=requirement.id,
+            kind="clarification_spec",
+            version=1,
+            content_json=json.dumps(
+                {"summary": "需要补充", "open_questions": ["使用什么测试命令？"]}
+            ),
+            content_markdown="# 需要补充",
+        )
+    )
+    requirement.status = RequirementStatus.AWAITING_CLARIFICATION
+    session.flush()
+    settings = Settings(
+        _env_file=None,
+        repository_automation_enabled=True,
+        llm_provider="fake",
+    )
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
+
+    analysis_task = transition_requirement(
+        session,
+        requirement,
+        "request_more_clarification",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+        "请先从仓库确认，不要再问我技术栈。",
+    )
+
+    assert analysis_task is not None
+    assert analysis_task.task_type == "git.prepare_analysis"
+    analysis_context = json.loads(analysis_task.payload_json)["context"]
+    assert analysis_context["conversation"][-1]["body"] == "请先从仓库确认，不要再问我技术栈。"
+
+    repository_analysis = {
+        "source": "trusted_read_only_checkout",
+        "repositories": [{"repository_id": repository.id, "head_sha": "abc123"}],
+    }
+    process_task_result(
+        session,
+        {
+            "task_id": analysis_task.id,
+            "status": "completed",
+            "output": repository_analysis,
+        },
+    )
+
+    clarifier_task = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.clarify",
+        )
+    ).one()
+    clarifier_context = json.loads(clarifier_task.payload_json)["context"]
+    assert clarifier_context["artifacts"]["repository_analysis"] == repository_analysis
+    assert clarifier_context["conversation"][-1]["body"] == "请先从仓库确认，不要再问我技术栈。"
 
 
 def test_clarifier_without_open_questions_automatically_starts_architecture(monkeypatch) -> None:
@@ -111,6 +350,62 @@ def test_clarifier_without_open_questions_automatically_starts_architecture(monk
     ).one()
     assert requirement.status == RequirementStatus.PLANNING
     assert architect is not None
+
+
+def test_architecture_confidence_above_threshold_auto_approves_with_audit(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    complete_architecture_at_confidence(session, requirement, monkeypatch, 91)
+
+    assert requirement.status == RequirementStatus.DEVELOPING
+    developer = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.develop",
+        )
+    ).one()
+    assert developer is not None
+    automatic_approval = session.scalars(
+        select(WorkflowTransition).where(
+            WorkflowTransition.requirement_id == requirement.id,
+            WorkflowTransition.event == "confirm_plan",
+        )
+    ).one()
+    assert automatic_approval.actor_type == "system"
+    assert automatic_approval.actor_id is None
+    assert "91%" in automatic_approval.reason
+    assert "90%" in automatic_approval.reason
+
+
+def test_architecture_confidence_equal_to_threshold_requires_human_review(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    complete_architecture_at_confidence(session, requirement, monkeypatch, 90)
+
+    assert requirement.status == RequirementStatus.AWAITING_PLAN
+    assert not session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.develop",
+        )
+    ).all()
+    assert not session.scalars(
+        select(WorkflowTransition).where(
+            WorkflowTransition.requirement_id == requirement.id,
+            WorkflowTransition.event == "confirm_plan",
+        )
+    ).all()
+
+
+def test_architecture_without_confidence_safely_requires_human_review(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    complete_architecture_at_confidence(session, requirement, monkeypatch, None)
+
+    assert requirement.status == RequirementStatus.AWAITING_PLAN
+    assert not session.scalars(
+        select(WorkflowTransition).where(
+            WorkflowTransition.requirement_id == requirement.id,
+            WorkflowTransition.event == "confirm_plan",
+        )
+    ).all()
 
 
 def test_clarifier_with_open_questions_waits_for_requester(monkeypatch) -> None:
@@ -258,6 +553,7 @@ def test_legacy_blocked_plan_retry_rebuilds_missing_workspace_before_development
     session.flush()
     settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
     monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
 
     revision = transition_requirement(
         session,
@@ -335,6 +631,159 @@ def test_legacy_blocked_development_retry_prepares_workspace_when_manifest_is_mi
 
     assert task is not None and task.task_type == "git.prepare_workspaces"
     assert requirement.review_failures == 0
+
+
+def test_blocked_review_retry_only_reschedules_code_review(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    requirement.status = RequirementStatus.BLOCKED
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "retry_review",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.REVIEWING
+    assert task is not None and task.task_type == "agent.review"
+    assert not session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "agent.develop",
+        )
+    ).all()
+
+
+def test_blocked_clarifier_retry_refreshes_repository_analysis(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    repository = RepositoryConnection(
+        project_id=requirement.project_id,
+        provider="github",
+        external_id="retry-clarifier-1",
+        full_name="acme/retry-clarifier",
+        clone_url="https://github.com/acme/retry-clarifier.git",
+        web_url="https://github.com/acme/retry-clarifier",
+    )
+    session.add(repository)
+    session.flush()
+    session.add(
+        RequirementRepository(
+            requirement_id=requirement.id,
+            repository_id=repository.id,
+            target_branch="main",
+        )
+    )
+    session.add(
+        AgentRun(
+            requirement_id=requirement.id,
+            agent_key="agent1",
+            role="clarify",
+            status="failed",
+            model="deepseek-v4-flash",
+            error_code="agent.pi_turn_budget_exhausted",
+        )
+    )
+    requirement.status = RequirementStatus.BLOCKED
+    session.flush()
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "retry_clarification",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.CLARIFYING
+    assert task is not None and task.task_type == "git.prepare_analysis"
+
+
+def test_blocked_clarifier_retry_rejects_other_latest_failed_role() -> None:
+    session, requirement = session_with_requirement()
+    session.add(
+        AgentRun(
+            requirement_id=requirement.id,
+            agent_key="agent3",
+            role="develop",
+            status="failed",
+            model="deepseek-v4-flash",
+        )
+    )
+    requirement.status = RequirementStatus.BLOCKED
+    session.flush()
+
+    with pytest.raises(WorkflowError, match="failed clarifier"):
+        transition_requirement(
+            session,
+            requirement,
+            "retry_clarification",
+            requirement.version,
+            "user",
+            requirement.owner_id,
+        )
+
+
+def test_blocked_clarification_repository_analysis_can_retry(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    repository = RepositoryConnection(
+        project_id=requirement.project_id,
+        provider="github",
+        external_id="retry-analysis-1",
+        full_name="acme/retry-analysis",
+        clone_url="https://github.com/acme/retry-analysis.git",
+        web_url="https://github.com/acme/retry-analysis",
+    )
+    session.add(repository)
+    session.flush()
+    session.add(
+        RequirementRepository(
+            requirement_id=requirement.id,
+            repository_id=repository.id,
+            target_branch="main",
+        )
+    )
+    session.add(
+        WorkflowTask(
+            requirement_id=requirement.id,
+            task_type="git.prepare_analysis",
+            status="failed",
+            idempotency_key="failed-clarification-analysis",
+            payload_json="{}",
+        )
+    )
+    session.add(
+        WorkflowTransition(
+            requirement_id=requirement.id,
+            from_status=RequirementStatus.CLARIFYING.value,
+            to_status=RequirementStatus.BLOCKED.value,
+            event="technical_failure",
+            actor_type="system",
+            reason="git.command_failed: clone failed",
+        )
+    )
+    requirement.status = RequirementStatus.BLOCKED
+    session.flush()
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "retry_clarification",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.CLARIFYING
+    assert task is not None and task.task_type == "git.prepare_analysis"
 
 
 def test_blocked_acceptance_retry_rebuilds_clean_verification_workspace(monkeypatch) -> None:
@@ -1108,6 +1557,26 @@ def test_repository_automation_routes_local_commit_review_then_publish(monkeypat
             content_markdown="stale rejection",
         )
     )
+    session.add(
+        ArtifactVersion(
+            requirement_id=requirement.id,
+            kind="acceptance_report",
+            version=1,
+            content_json=json.dumps(
+                {"approved": False, "summary": "stale acceptance from an older head"}
+            ),
+            content_markdown="stale acceptance",
+        )
+    )
+    session.add(
+        ArtifactVersion(
+            requirement_id=requirement.id,
+            kind="verification_manifest",
+            version=1,
+            content_json=json.dumps({"repositories": [{"head_sha": "old-head"}]}),
+            content_markdown="old verification checkout",
+        )
+    )
     session.flush()
 
     process_task_result(
@@ -1147,6 +1616,8 @@ def test_repository_automation_routes_local_commit_review_then_publish(monkeypat
     assert review_context["artifacts"]["development_commit_manifest"]["combined_diff"].startswith("diff --git")
     assert review_context["artifacts"]["development_commit_manifest"]["repositories"][0]["changed_files"][0]["content"] == "after\n"
     assert "code_review_report" not in review_context["artifacts"]
+    assert "acceptance_report" not in review_context["artifacts"]
+    assert "verification_manifest" not in review_context["artifacts"]
     assert review_context["review_stage_policy"]["stage"] == "pre_publish"
     assert review_context["review_stage_policy"]["missing_push_is_not_a_review_finding"] is True
     process_task_result(
@@ -1202,6 +1673,7 @@ def test_repository_automation_routes_local_commit_review_then_publish(monkeypat
     ).one()
     acceptance_context = json.loads(acceptance_task.payload_json)["context"]
     assert acceptance_context["artifacts"]["verification_manifest"]["checkout_type"] == "published_heads"
+    assert "acceptance_report" not in acceptance_context["artifacts"]
 
 
 def test_repository_automation_prepares_real_analysis_before_architect(monkeypatch) -> None:
@@ -1230,6 +1702,7 @@ def test_repository_automation_prepares_real_analysis_before_architect(monkeypat
     session.flush()
     settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
     monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
     analysis_task = transition_requirement(
         session, requirement, "confirm_clarification", requirement.version, "user", requirement.owner_id
     )
@@ -1251,6 +1724,29 @@ def test_repository_automation_prepares_real_analysis_before_architect(monkeypat
     architect_context = json.loads(architect_task.payload_json)["context"]
     assert requirement.status == RequirementStatus.PLANNING
     assert architect_context["artifacts"]["repository_analysis"]["repositories"][0]["file_tree"] == ["README.md"]
+
+    process_task_result(
+        session,
+        {
+            "task_id": architect_task.id,
+            "status": "completed",
+            "output": {
+                "summary": "仓库证据充分，方案可以实施",
+                "target_architecture": "保持现有模块边界",
+                "confidence": 91,
+            },
+        },
+    )
+
+    workspace_task = session.scalars(
+        select(WorkflowTask).where(
+            WorkflowTask.requirement_id == requirement.id,
+            WorkflowTask.task_type == "git.prepare_workspaces",
+        )
+    ).one()
+    workspace_context = json.loads(workspace_task.payload_json)["context"]
+    assert requirement.status == RequirementStatus.DEVELOPING
+    assert workspace_context["artifacts"]["architecture_plan"]["confidence"] == 91
 
 
 def test_retryable_worker_failure_gets_new_task_before_requirement_blocks(monkeypatch) -> None:
@@ -1321,6 +1817,57 @@ def test_terminal_agent_failure_persists_diagnostic_reason(monkeypatch) -> None:
         .order_by(WorkflowTransition.created_at.desc())
     ).first()
     assert transition.reason == "agent.step_budget_exhausted: developer tool loop exhausted after repeated reads"
+
+
+def test_turn_budget_failure_blocks_without_retry_and_persists_diagnostics(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    settings = Settings(_env_file=None, task_max_attempts=3, llm_provider="fake")
+    monkeypatch.setattr("app.services.task_results.get_settings", lambda: settings)
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+    task = transition_requirement(
+        session,
+        requirement,
+        "publish",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    process_task_result(
+        session,
+        {
+            "task_id": task.id,
+            "status": "failed",
+            "error_code": "agent.pi_turn_budget_exhausted",
+            "error_message": "exhausted 50 turns",
+            "retryable": False,
+            "token_usage": 999,
+            "diagnostics": {
+                "turns": 50,
+                "max_turns": 50,
+                "tool_calls": 44,
+                "tool_errors": 1,
+                "tool_call_counts": {"read_file": 44},
+                "last_stop_reason": "stop",
+                "terminal_tool_called": False,
+            },
+        },
+    )
+
+    tasks = session.scalars(
+        select(WorkflowTask).where(WorkflowTask.requirement_id == requirement.id)
+    ).all()
+    run = session.get(AgentRun, task.agent_run_id)
+    blocked = session.scalars(
+        select(WorkflowTransition)
+        .where(WorkflowTransition.requirement_id == requirement.id)
+        .order_by(WorkflowTransition.created_at.desc())
+    ).first()
+    assert len(tasks) == 1
+    assert requirement.status == RequirementStatus.BLOCKED
+    assert run.token_usage == 999
+    assert json.loads(run.diagnostics_json)["turns"] == 50
+    assert blocked.actor_id == run.id
 
 
 def test_review_rework_and_acceptance_replanning_feed_evidence_back_to_developer(monkeypatch) -> None:

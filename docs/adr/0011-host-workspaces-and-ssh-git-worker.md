@@ -13,7 +13,7 @@ Docker Named Volume 隔离性好，但运维人员不方便直接查看 Agent �
 2. `${HOST_SSH_DIR:-$HOME/.ssh}` 只读挂载到 `git-worker:/home/forgeflow/.ssh`。不把 SSH 目录挂载给 Control Plane、Agent Worker 或 Sandbox Executor。
 3. `${HOST_WORKSPACE_ROOT:-./data/workspaces}` 绑定挂载为所有代码执行组件共同使用的 `/workspaces`。默认目录位于项目的 `data/workspaces/`，已被 Git 忽略。
 4. 允许无凭据 HTTPS、标准 SCP 风格 SSH 和 `ssh://` clone URL；强制 Provider 主机白名单、SSH 用户 `git`、非交互认证及严格 Host Key 校验。
-5. SSH 只负责 Git 数据面。PR/MR、Checks、Webhook 与 Merge API 仍使用最小权限 Provider Token。
+5. SSH 只负责 Git 数据面。PR/MR、CI 状态、Webhook 与 Merge API 仍使用最小权限 Provider Token。
 
 ## 结果
 

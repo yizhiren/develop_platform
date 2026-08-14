@@ -116,6 +116,73 @@ async def test_retry_can_restore_a_missing_tracked_file_before_continuing(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_review_rework_can_restore_one_file_from_parent_commit(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    subprocess.run(["git", "init"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+    target = repository / "architecture.test.py"
+    target.write_text("def test_boundary():\n    assert True\n")
+    subprocess.run(["git", "add", "architecture.test.py"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "complete"], cwd=repository, check=True, capture_output=True)
+    target.write_text("assert BROKEN\n")
+    subprocess.run(["git", "add", "architecture.test.py"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "truncated"], cwd=repository, check=True, capture_output=True)
+    provider = ScriptedProvider([
+        {"action": "read_file", "path": "repo-1/architecture.test.py"},
+        {
+            "action": "run_command",
+            "argv": [
+                "python",
+                "-c",
+                "from pathlib import Path; text=Path('architecture.test.py').read_text(); assert 'test_boundary' in text and 'BROKEN' not in text",
+            ],
+            "cwd": "repo-1",
+        },
+        {
+            "action": "finish",
+            "report": {
+                "summary": "Restored the complete reviewed test file from the parent commit.",
+                "repositories_changed": ["repo-1"],
+                "commits": {},
+                "tests": [],
+                "unresolved_risks": [],
+            },
+        },
+    ])
+    context = {
+        "artifacts": {
+            "workspace_manifest": {
+                "workspace_root": str(tmp_path),
+                "repositories": [{"repository_id": "repo-1", "relative_path": "repo-1"}],
+            },
+            "code_review_report": {
+                "approved": False,
+                "findings": [{
+                    "severity": "blocker",
+                    "path": "architecture.test.py",
+                    "required_change": "Restore the file truncated in the current HEAD.",
+                }],
+            },
+            "development_commit_manifest": {
+                "repositories": [{"repository_id": "repo-1", "head_sha": "current-head"}]
+            },
+        }
+    }
+
+    report, _ = await DeveloperToolLoop(provider).run(context)
+
+    assert provider.users[0]["observation"]["automatic_recoveries"] == [
+        "repo-1/architecture.test.py"
+    ]
+    assert provider.users[0]["progress"]["mutated_paths"] == ["repo-1/architecture.test.py"]
+    assert target.read_text() == "def test_boundary():\n    assert True\n"
+    assert report.files_changed == ["repo-1/architecture.test.py"]
+    assert "restore_previous_file" in provider.systems[0]
+
+
+@pytest.mark.asyncio
 async def test_developer_agent_modifies_workspace_and_runs_real_test(tmp_path: Path) -> None:
     repository = tmp_path / "repo-1"
     repository.mkdir()
@@ -945,6 +1012,11 @@ def test_build_package_and_smoke_scripts_count_as_validation_commands() -> None:
     assert _is_validation_command(["pnpm", "run", "package:cli"])
     assert _is_validation_command(["yarn", "smoke:cli"])
     assert _is_validation_command(["npx", "tsc", "--noEmit"])
+    assert not _is_validation_command(
+        ["npm", "exec", "jest", "--runInBand", "tests/unit/architectureBoundaries.test.ts"]
+    )
+    assert not _is_validation_command(["pnpm", "dlx", "vitest"])
+    assert not _is_validation_command(["npm", "run", "start"])
 
 
 @pytest.mark.asyncio
@@ -1073,3 +1145,149 @@ async def test_developer_agent_rejects_empty_or_duplicate_markdown_sections(tmp_
     assert provider.users[3]["observation"]["message"] == "Markdown 质量门禁未通过，修复后才能 finish"
     assert any("duplicate heading" in item for item in provider.users[3]["observation"]["issues"])
     assert any("empty heading" in item for item in provider.users[3]["observation"]["issues"])
+
+
+@pytest.mark.asyncio
+async def test_developer_agent_can_search_real_symbols_before_editing(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    target = repository / "implementation.py"
+    target.write_text("def actual_service():\n    return 1\n")
+    provider = ScriptedProvider([
+        {"action": "search_text", "path": "repo-1", "query": "actual_service"},
+        {
+            "action": "replace_text",
+            "path": "repo-1/implementation.py",
+            "old": "return 1",
+            "new": "return 2",
+        },
+        {
+            "action": "run_command",
+            "argv": ["python", "-c", "from implementation import actual_service; assert actual_service() == 2"],
+            "cwd": "repo-1",
+        },
+        {
+            "action": "finish",
+            "report": {
+                "summary": "Updated the implementation found through workspace search.",
+                "repositories_changed": ["repo-1"],
+                "commits": {},
+                "tests": [],
+                "unresolved_risks": [],
+            },
+        },
+    ])
+    context = {
+        "artifacts": {
+            "workspace_manifest": {
+                "workspace_root": str(tmp_path),
+                "repositories": [{"repository_id": "repo-1", "relative_path": "repo-1"}],
+            }
+        }
+    }
+
+    report, _ = await DeveloperToolLoop(provider).run(context)
+
+    assert provider.users[1]["observation"] == {
+        "type": "search_results",
+        "query": "actual_service",
+        "matches": [
+            {
+                "path": "repo-1/implementation.py",
+                "line": 1,
+                "text": "def actual_service():",
+            }
+        ],
+    }
+    assert report.files_changed == ["repo-1/implementation.py"]
+    assert "search_text" in provider.systems[0]
+
+
+@pytest.mark.asyncio
+async def test_developer_agent_treats_repeated_delete_as_successful_noop(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    target = repository / "obsolete.py"
+    target.write_text("OBSOLETE = True\n")
+    provider = ScriptedProvider([
+        {"action": "delete_file", "path": "repo-1/obsolete.py"},
+        {"action": "delete_file", "path": "repo-1/obsolete.py"},
+        {
+            "action": "run_command",
+            "argv": ["python", "-c", "from pathlib import Path; assert not Path('obsolete.py').exists()"],
+            "cwd": "repo-1",
+        },
+        {
+            "action": "finish",
+            "report": {
+                "summary": "Removed the obsolete entry once and verified it remains absent.",
+                "repositories_changed": ["repo-1"],
+                "commits": {},
+                "tests": [],
+                "unresolved_risks": [],
+            },
+        },
+    ])
+    context = {
+        "artifacts": {
+            "workspace_manifest": {
+                "workspace_root": str(tmp_path),
+                "repositories": [{"repository_id": "repo-1", "relative_path": "repo-1"}],
+            }
+        }
+    }
+
+    report, _ = await DeveloperToolLoop(provider).run(context)
+
+    assert provider.users[2]["observation"]["type"] == "delete"
+    assert provider.users[2]["observation"]["changed"] is False
+    assert "already absent" in provider.users[2]["observation"]["message"]
+    assert report.files_changed == ["repo-1/obsolete.py"]
+
+
+@pytest.mark.asyncio
+async def test_developer_agent_blocks_python_file_mutation_outside_explicit_tools(tmp_path: Path) -> None:
+    repository = tmp_path / "repo-1"
+    repository.mkdir()
+    provider = ScriptedProvider([
+        {
+            "action": "run_command",
+            "argv": [
+                "python",
+                "-c",
+                "from pathlib import Path; Path('generated.py').write_text('VALUE = 1\\n')",
+            ],
+            "cwd": "repo-1",
+        },
+        {"action": "write_file", "path": "repo-1/generated.py", "content": "VALUE = 2\n"},
+        {
+            "action": "run_command",
+            "argv": ["python", "-c", "from generated import VALUE; assert VALUE == 2"],
+            "cwd": "repo-1",
+        },
+        {
+            "action": "finish",
+            "report": {
+                "summary": "Created the source through an explicit tracked mutation.",
+                "repositories_changed": ["repo-1"],
+                "commits": {},
+                "tests": [],
+                "unresolved_risks": [],
+            },
+        },
+    ])
+    context = {
+        "artifacts": {
+            "workspace_manifest": {
+                "workspace_root": str(tmp_path),
+                "repositories": [{"repository_id": "repo-1", "relative_path": "repo-1"}],
+            }
+        }
+    }
+
+    report, _ = await DeveloperToolLoop(provider).run(context)
+
+    assert provider.users[1]["observation"]["type"] == "action_blocked"
+    assert "显式文件工具" in provider.users[1]["observation"]["message"]
+    assert (repository / "generated.py").read_text() == "VALUE = 2\n"
+    assert report.files_changed == ["repo-1/generated.py"]

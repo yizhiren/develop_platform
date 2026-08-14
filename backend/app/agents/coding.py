@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import difflib
 import hashlib
 import json
@@ -81,6 +82,7 @@ class DeveloperValidationStalled(AgentOutputError):
 class DeveloperAction(BaseModel):
     action: Literal[
         "list_files",
+        "search_text",
         "read_file",
         "read_lines",
         "write_file",
@@ -88,10 +90,12 @@ class DeveloperAction(BaseModel):
         "replace_lines",
         "delete_file",
         "restore_file",
+        "restore_previous_file",
         "run_command",
         "finish",
     ]
     path: str | None = None
+    query: str | None = None
     content: str | None = None
     old: str | None = None
     new: str | None = None
@@ -138,7 +142,9 @@ class DeveloperToolLoop:
             "Python 验证必须使用 assert、sys.exit 或显式抛错表达失败条件。commit/push 由可信 Git Worker 在 finish 后执行，绝不能提前声称已完成。"
             "run_command 仅允许 pytest、python、python3、npm、pnpm、yarn、go、cargo、make，以及仅用于内置测试运行器的 node --test；"
             "方案中的 ls/find/grep/git/test 等命令不可直接执行，"
-            "应使用 list_files/read_file 或 python/python3 编写等价的只读验证。不要反复读取同一文件；确认目标后尽早完成最小充分修改。"
+            "应使用 list_files/search_text/read_file 查找和读取仓库事实，或用 python/python3 编写带失败条件的只读验证。"
+            "run_command 只用于验证，禁止借助 Python、测试脚本或构建命令创建、修改、移动或删除源码与测试；所有交付文件修改必须使用显式文件工具。"
+            "不要反复读取或搜索同一内容；确认目标后尽早完成最小充分修改。"
             "首次开发若现有实现已经基本满足需求，也必须根据验收标准做一项可审查的最小有效改进；"
             "返工时若已有 development_commit_manifest，且 code_review_report 仅要求补充验证证据，允许不修改源码，"
             "但必须运行对应的可失败验证命令，并在 finish.report 中填写 repositories_changed=[]；"
@@ -164,11 +170,23 @@ class DeveloperToolLoop:
             "例如应写 AGENTS.md，而不是 <repository_id>/AGENTS.md。"
             "若上一次尝试误删或破坏了已跟踪文件，且最新验证明确因该文件缺失而失败，可使用 restore_file 将该单个文件恢复到当前 HEAD；"
             "恢复后必须重新读取、做必要的聚焦修改并验证，禁止把 restore_file 当作仓库级回退。"
+            "若 code_review_report 明确证明当前 HEAD 中的某个已提交文件被截断、覆盖或严重破坏，"
+            "必须先用 restore_previous_file 从 HEAD 的父提交恢复该单个文件，再读取、做聚焦修改并运行真实测试；禁止凭空重写原文件。"
             "使用相对 workspace_root 的路径；多个仓库位于各自 repository_id 目录。finish.report 必须准确描述实际改动和测试。"
             f"\nDeveloperAction JSON Schema:\n{action_schema}"
         )
         safe_context = _compact_context(context, manifest)
-        observation: dict[str, Any] = {"type": "workspace", "files": sandbox.list_files(limit=300)}
+        automatic_recoveries, automatic_recovery_errors = _restore_review_corrupted_files(
+            safe_context,
+            manifest,
+            sandbox,
+        )
+        observation: dict[str, Any] = {
+            "type": "workspace",
+            "files": sandbox.list_files(limit=300),
+            "automatic_recoveries": automatic_recoveries,
+            "automatic_recovery_errors": automatic_recovery_errors,
+        }
         transcript: list[dict[str, Any]] = []
         prompt_tokens = completion_tokens = 0
         model = ""
@@ -180,6 +198,7 @@ class DeveloperToolLoop:
             for path in safe_context.get("previous_attempt_changed_paths", [])
             if isinstance(path, str) and _changed_repository_ids({path}, manifest.get("repositories", []))
         }
+        mutated_paths.update(automatic_recoveries)
         action_counts: dict[str, int] = {}
         read_path_counts: dict[str, int] = {}
         invalid_output_count = 0
@@ -321,7 +340,7 @@ class DeveloperToolLoop:
                 transcript.append({"action": signature, "observation": observation})
                 continue
             action_counts[signature] = action_counts.get(signature, 0) + 1
-            read_only_action = action.action in {"list_files", "read_file", "read_lines"}
+            read_only_action = action.action in {"list_files", "search_text", "read_file", "read_lines"}
             duplicate_read = read_only_action and action_counts[signature] > self.MAX_IDENTICAL_READ_ACTIONS
             read_path = action.path if action.action in {"read_file", "read_lines"} else None
             if read_path:
@@ -350,6 +369,15 @@ class DeveloperToolLoop:
                         "type": "action_blocked",
                         "action": action.action,
                         "message": "禁止用 Python print/open/read_text 代替文件读取；请使用 read_file 或 read_lines，并把步骤留给实现与验证。",
+                    }
+                elif action.action == "run_command" and _python_command_mutates_workspace(action.argv or []):
+                    observation = {
+                        "type": "action_blocked",
+                        "action": action.action,
+                        "message": (
+                            "run_command 仅用于验证，不能创建、修改、移动或删除工作区文件；"
+                            "请用 write_file、replace_text、replace_lines 或 delete_file 等显式文件工具提交可追踪修改。"
+                        ),
                     }
                 elif action.action == "replace_lines" and action.path not in read_paths:
                     observation = {
@@ -418,7 +446,22 @@ class DeveloperToolLoop:
                         str(observation.get("message", "tool error")),
                         prompt_tokens + completion_tokens,
                     )
-            if action.action in {"write_file", "replace_text", "replace_lines", "delete_file", "restore_file"} and action.path and observation.get("type") != "tool_error":
+            if (
+                action.action in {
+                    "write_file",
+                    "replace_text",
+                    "replace_lines",
+                    "delete_file",
+                    "restore_file",
+                    "restore_previous_file",
+                }
+                and action.path
+                and observation.get("type") != "tool_error"
+                and (
+                    observation.get("changed", True)
+                    or (action.action == "delete_file" and safe_context.get("prior_commit_available"))
+                )
+            ):
                 if action.action == "restore_file":
                     mutated_paths.discard(action.path)
                     missing_previous_paths = [
@@ -567,6 +610,14 @@ class DeveloperToolLoop:
     ) -> dict[str, Any]:
         if action.action == "list_files":
             return {"type": "files", "files": sandbox.list_files(action.path or ".", limit=300)}
+        if action.action == "search_text":
+            if not action.query:
+                raise ValueError("search_text requires query")
+            return {
+                "type": "search_results",
+                "query": action.query,
+                "matches": sandbox.search_text(action.query, action.path or ".", limit=100),
+            }
         if action.action == "read_file":
             if not action.path:
                 raise ValueError("read_file requires path")
@@ -681,16 +732,28 @@ class DeveloperToolLoop:
         if action.action == "delete_file":
             if not action.path:
                 raise ValueError("delete_file requires path")
-            sandbox.delete_file(action.path)
-            return {"type": "delete", "path": action.path}
+            changed = sandbox.delete_file(action.path)
+            return {
+                "type": "delete",
+                "path": action.path,
+                "changed": changed,
+                "message": "file deleted" if changed else "file was already absent; do not retry deletion",
+            }
         if action.action == "restore_file":
             if not action.path:
                 raise ValueError("restore_file requires path")
             sandbox.restore_file(action.path)
             return {"type": "restore", "path": action.path}
+        if action.action == "restore_previous_file":
+            if not action.path:
+                raise ValueError("restore_previous_file requires path")
+            sandbox.restore_file(action.path, source="HEAD^")
+            return {"type": "restore_previous", "path": action.path}
         if action.action == "run_command":
             if not action.argv:
                 raise ValueError("run_command requires argv")
+            if _python_command_mutates_workspace(action.argv):
+                raise ValueError("Python validation command may not mutate workspace files")
             result = sandbox.run(action.argv, action.cwd)
             return {"type": "command", "argv": result.argv, "returncode": result.returncode, "output": result.output, "truncated": result.truncated}
         if action.action == "finish":
@@ -805,6 +868,8 @@ def _text_similarity(left: str, right: str) -> float:
 def _action_signature(action: DeveloperAction) -> str:
     if action.action == "run_command":
         target = " ".join(action.argv or [])
+    elif action.action == "search_text":
+        target = f"{action.path or '.'}:{action.query or ''}"
     elif action.action == "replace_text":
         source_digest = hashlib.sha256((action.old or "").encode()).hexdigest()[:12]
         target = f"{action.path or ''}:source-{source_digest}"
@@ -830,6 +895,52 @@ def _normalize_action(action: DeveloperAction, manifest: dict[str, Any]) -> Deve
             if action.action == "run_command" and action.cwd == ".":
                 updates["cwd"] = repository_root
     return action.model_copy(update=updates) if updates else action
+
+
+def _restore_review_corrupted_files(
+    context: dict[str, Any],
+    manifest: dict[str, Any],
+    sandbox: WorkspaceSandbox,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Deterministically undo a reviewer-proven single-file corruption from HEAD."""
+    if not context.get("prior_commit_available"):
+        return [], []
+    review = context.get("artifacts", {}).get("code_review_report", {})
+    findings = review.get("findings", []) if isinstance(review, dict) else []
+    corruption_markers = (
+        "不完整",
+        "严重破坏",
+        "截断",
+        "覆盖",
+        "corrupt",
+        "incomplete",
+        "overwrite",
+        "truncat",
+    )
+    recovered: list[str] = []
+    errors: list[dict[str, str]] = []
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("severity") not in {"blocker", "high"}:
+            continue
+        path = str(finding.get("path") or "").strip()
+        detail = " ".join(
+            str(finding.get(field) or "")
+            for field in ("title", "rationale", "required_change")
+        ).casefold()
+        if not path or not any(marker in detail for marker in corruption_markers):
+            continue
+        normalized = _normalize_action(
+            DeveloperAction(action="restore_previous_file", path=path),
+            manifest,
+        ).path
+        if not normalized or normalized in recovered:
+            continue
+        try:
+            sandbox.restore_file(normalized, source="HEAD^")
+            recovered.append(normalized)
+        except (SandboxViolation, OSError, ValueError) as exc:
+            errors.append({"path": normalized, "message": str(exc)[:500]})
+    return recovered, errors
 
 
 def _broad_rewrite_is_authorized(
@@ -915,6 +1026,96 @@ def _is_print_only_python_command(argv: list[str]) -> bool:
     return any(marker in script for marker in inspection_markers) and not any(
         marker in script for marker in validation_markers
     )
+
+
+def _python_command_mutates_workspace(argv: list[str]) -> bool:
+    """Reject inline Python that bypasses explicit, auditable file mutation tools."""
+    if not argv or Path(argv[0]).name not in {"python", "python3"} or "-c" not in argv:
+        return False
+    index = argv.index("-c")
+    script = argv[index + 1] if len(argv) > index + 1 else ""
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return False
+
+    mutating_path_methods = {
+        "chmod",
+        "hardlink_to",
+        "lchmod",
+        "mkdir",
+        "rename",
+        "rmdir",
+        "symlink_to",
+        "touch",
+        "unlink",
+        "write_bytes",
+        "write_text",
+    }
+    mutating_calls = {
+        "os.chmod",
+        "os.link",
+        "os.makedirs",
+        "os.mkdir",
+        "os.remove",
+        "os.removedirs",
+        "os.rename",
+        "os.renames",
+        "os.replace",
+        "os.rmdir",
+        "os.symlink",
+        "os.truncate",
+        "os.unlink",
+        "shutil.copy",
+        "shutil.copy2",
+        "shutil.copyfile",
+        "shutil.copytree",
+        "shutil.move",
+        "shutil.rmtree",
+    }
+    process_escape_calls = {
+        "os.popen",
+        "os.system",
+        "subprocess.call",
+        "subprocess.Popen",
+        "subprocess.run",
+    }
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_name = _python_call_name(node.func)
+        method_name = call_name.rsplit(".", 1)[-1]
+        if (
+            method_name in mutating_path_methods
+            or call_name in mutating_calls
+            or call_name in process_escape_calls
+        ):
+            return True
+        if method_name != "open":
+            continue
+        mode_node: ast.AST | None = None
+        if isinstance(node.func, ast.Name) and len(node.args) >= 2:
+            mode_node = node.args[1]
+        elif isinstance(node.func, ast.Attribute) and node.args:
+            mode_node = node.args[0]
+        else:
+            mode_node = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "mode"),
+                None,
+            )
+        if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+            if any(marker in mode_node.value for marker in ("w", "a", "x", "+")):
+                return True
+    return False
+
+
+def _python_call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _python_call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
 
 
 def _compact_context(context: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1131,9 +1332,10 @@ def _is_validation_command(argv: list[str]) -> bool:
         return True
     if executable in {"npm", "pnpm", "yarn"}:
         validation_prefixes = ("test", "typecheck", "lint", "check", "build", "package", "smoke")
-        if any(item.startswith(validation_prefixes) for item in lowered[:4]):
-            return True
-        return "tsc" in lowered[:4] and "--noemit" in lowered
+        if not lowered or lowered[0] in {"exec", "dlx"}:
+            return False
+        script = lowered[1] if lowered[0] == "run" and len(lowered) > 1 else lowered[0]
+        return script.startswith(validation_prefixes)
     if executable == "npx":
         local_tool = next((item for item in lowered if not item.startswith("-")), "")
         return local_tool in {"tsc", "eslint", "vitest", "jest", "prettier"}

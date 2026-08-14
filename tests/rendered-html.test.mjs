@@ -71,6 +71,11 @@ test("keeps the product metadata and security copy", async () => {
   assert.match(page, /workflowTaskLabels/);
   assert.match(page, /task\.agent_run_id === null/);
   assert.match(page, /画板 \/ Git 正在执行/);
+  assert.match(page, /analysis_ready: "读取仓库现状"/);
+  assert.match(
+    page,
+    /const platformTimelineEvents = new Set\(\[[\s\S]*?"analysis_ready"[\s\S]*?\]\);/,
+  );
   assert.match(page, /\/api\/v1\/requirements\/\$\{item\.id\}\/tasks/);
   assert.match(page, /完整审计日志/);
   assert.match(page, /aria-label="需求协作泳道图"/);
@@ -91,6 +96,14 @@ test("keeps the product metadata and security copy", async () => {
   assert.match(page, /澄清已完成，正在启动系统架构师/);
   assert.doesNotMatch(page, />确认需求规格</);
   assert.match(page, /实现方案评审/);
+  assert.match(page, /方案置信度/);
+  assert.match(page, /需人工审核/);
+  assert.match(page, /本方案未达到自动批准条件/);
+  assert.match(page, /自动批准实现方案/);
+  assert.match(
+    page,
+    /const platformTimelineEvents = new Set\(\[[\s\S]*?"confirm_plan"[\s\S]*?\]\);/,
+  );
   assert.match(page, /批准方案并开始开发/);
   assert.match(page, /要求系统架构师调整/);
   assert.match(page, /目标方案/);
@@ -99,6 +112,21 @@ test("keeps the product metadata and security copy", async () => {
   assert.match(page, /完整错误详情/);
   assert.match(page, /开发工程师未能在步骤上限内完成/);
   assert.match(page, /开发工程师连续返回了不可执行的动作/);
+  assert.match(page, /代码评审输出未通过平台校验/);
+  assert.match(page, /重新执行代码评审，无需重跑开发/);
+  assert.match(page, /\["retry_review", "重试代码评审"\]/);
+  assert.match(page, /模型 API Key 未配置/);
+  assert.match(page, /加载 \.env\.local 重启 Agent Worker/);
+  assert.match(page, /需求澄清师未在轮次上限内提交结论/);
+  assert.match(page, /run\.diagnostics\?\.max_turns \?\? 32/);
+  assert.match(page, /正在执行 · 上限 32 轮/);
+  assert.match(page, /\["retry_clarification", "重试需求澄清"\]/);
+  assert.match(page, /重新获取仓库信息并继续需求澄清/);
+  assert.match(
+    page,
+    /blockedDiagnostic\?\.recoveryEvent ===\s*"retry_clarification"/,
+  );
+  assert.match(page, /parseApiTimestamp/);
   assert.match(page, /从开发重试，复用当前开发分支/);
   assert.match(page, /run\.error_message/);
   assert.match(page, /timeline-reason/);

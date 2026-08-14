@@ -48,6 +48,7 @@ type WorkflowTaskState = {
   status: string;
   error_code: string | null;
   error_message: string | null;
+  diagnostics?: AgentRunDiagnostics;
 };
 type WorkflowTask = {
   id: string;
@@ -112,8 +113,18 @@ type AgentRun = {
   token_usage: number;
   error_code: string | null;
   error_message: string | null;
+  diagnostics?: AgentRunDiagnostics;
   created_at: string;
   completed_at: string | null;
+};
+type AgentRunDiagnostics = {
+  turns?: number;
+  max_turns?: number;
+  tool_calls?: number;
+  tool_errors?: number;
+  tool_call_counts?: Record<string, number>;
+  last_stop_reason?: string;
+  terminal_tool_called?: boolean;
 };
 type FailureDiagnostic = {
   title: string;
@@ -146,6 +157,7 @@ type RepositoryPlanContent = {
   merge_order: number;
 };
 type ArchitecturePlanContent = {
+  confidence: number;
   current_state: string;
   target_architecture: string;
   data_flow: string[];
@@ -167,6 +179,11 @@ const REQUIREMENT_IMAGE_TYPES = new Set([
   "image/jpeg",
   "image/webp",
 ]);
+
+function parseApiTimestamp(value: string): Date {
+  const hasTimeZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  return new Date(hasTimeZone ? value : `${value}Z`);
+}
 
 function readImageDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -325,11 +342,14 @@ const workflowTimelineLabels: Record<string, string> = {
   confirm_plan: "批准实现方案",
   request_plan_change: "要求调整方案",
   retry_planning: "要求重新设计",
+  retry_clarification: "重新执行需求澄清",
   retry_development: "要求重新开发",
+  retry_review: "重新执行代码评审",
   retry_acceptance: "重新准备验收",
   retry_regression: "要求重新回归",
   retry_merge: "重新准备合并",
   begin_merge: "批准合并",
+  analysis_ready: "读取仓库现状",
   workspace_ready: "准备开发工作区",
   workspace_restored: "恢复开发工作区",
   dependencies_ready: "准备项目依赖",
@@ -346,6 +366,8 @@ const workflowTimelineLabels: Record<string, string> = {
 };
 
 const platformTimelineEvents = new Set([
+  "confirm_plan",
+  "analysis_ready",
   "workspace_ready",
   "workspace_restored",
   "dependencies_ready",
@@ -408,7 +430,7 @@ const workflowRunOutcomeLabels: Record<
 };
 
 const workflowTaskLabels: Record<string, string> = {
-  "git.prepare_analysis": "读取仓库现状",
+  "git.prepare_analysis": "读取仓库上下文",
   "git.prepare_workspaces": "准备开发工作区",
   "git.restore_workspaces": "恢复开发工作区",
   "git.restore_validation_workspace": "恢复验收工作区",
@@ -458,6 +480,9 @@ function handoffLabel(
     "acceptor->platform": "验收通过 · 等待合并",
     "platform->acceptor": "合并结果 · 最终验收",
     "requester->platform": "人工授权",
+    "architect->platform": "高置信度方案 · 自动授权",
+    "platform->developer": "自动开工授权",
+    "platform->clarifier": "仓库现状、构建配置与需求说明",
     "platform->requester": "故障与恢复请求",
     "developer->platform": "代码变更",
     "platform->architect": "已提交分支与 SHA",
@@ -487,12 +512,16 @@ function WorkflowSwimlane({
         run.status === "completed" && outcomeTransition
           ? workflowRunOutcomeLabels[outcomeTransition.event]
           : undefined;
+      const turns = run.diagnostics?.turns;
+      const turnUsage = turns
+        ? ` · ${turns}/${run.diagnostics?.max_turns ?? 32} 轮`
+        : "";
       const activity =
         run.status === "running"
-          ? "正在执行"
+          ? "正在执行 · 上限 32 轮"
           : run.status === "queued"
             ? "等待 Worker"
-            : `${run.token_usage.toLocaleString("zh-CN")} tokens`;
+            : `${run.token_usage.toLocaleString("zh-CN")} tokens${turnUsage}`;
       return {
         id: `run-${run.id}`,
         lane: laneForAgent(run.agent_key),
@@ -541,7 +570,10 @@ function WorkflowSwimlane({
         return {
           id: `transition-${entry.id}`,
           lane: entry.actor_type === "user" ? "requester" : "platform",
-          title: workflowTimelineLabels[entry.event] ?? entry.event,
+          title:
+            entry.event === "confirm_plan" && entry.actor_type === "system"
+              ? "自动批准实现方案"
+              : (workflowTimelineLabels[entry.event] ?? entry.event),
           status: failed ? "failed" : "completed",
           timestamp: entry.created_at,
           meta: `${statusLabel[entry.from_status] ?? entry.from_status} → ${
@@ -553,7 +585,8 @@ function WorkflowSwimlane({
       });
     return [...runEvents, ...taskEvents, ...transitionEvents].sort(
       (left, right) =>
-        new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime(),
+        parseApiTimestamp(left.timestamp).getTime() -
+        parseApiTimestamp(right.timestamp).getTime(),
     );
   }, [agentRuns, timeline, workflowTasks]);
 
@@ -614,7 +647,7 @@ function WorkflowSwimlane({
                     <header>
                       <span className={`run-state ${event.status}`} />
                       <time dateTime={event.timestamp}>
-                        {new Date(event.timestamp).toLocaleString("zh-CN", {
+                        {parseApiTimestamp(event.timestamp).toLocaleString("zh-CN", {
                           month: "2-digit",
                           day: "2-digit",
                           hour: "2-digit",
@@ -661,6 +694,38 @@ function failureDiagnostic(
     : persistedDetail === code
       ? "这是一条旧失败记录，当时系统没有保存详细异常文本。"
       : persistedDetail;
+  if (
+    code === "agent.pi_turn_budget_exhausted" ||
+    (code === "agent.pi_bridge_failed" && run?.role === "clarify")
+  ) {
+    const metrics = run?.diagnostics;
+    const diagnosticDetail = metrics?.turns
+      ? `${detail}（轮次 ${metrics.turns}/${metrics.max_turns ?? 50}，工具调用 ${metrics.tool_calls ?? 0}，工具错误 ${metrics.tool_errors ?? 0}）`
+      : detail;
+    const recovery =
+      run?.role === "clarify"
+        ? ["retry_clarification", "建议：重新执行需求澄清"]
+        : run?.role === "review"
+          ? ["retry_review", "建议：重新执行代码评审"]
+          : run?.role === "regression"
+            ? ["retry_regression", "建议：重新执行组合回归"]
+            : run?.role === "architect" || run?.role === "revise"
+              ? ["retry_planning", "建议：从方案阶段重试"]
+              : run?.role === "develop"
+                ? ["retry_development", "建议：从开发阶段重试"]
+                : ["retry_acceptance", "建议：从验收阶段重试"];
+    return {
+      title:
+        run?.role === "clarify"
+          ? "需求澄清师未在轮次上限内提交结论"
+          : "Agent 未在轮次上限内提交结论",
+      summary:
+        `Agent 已获得最多 ${metrics?.max_turns ?? 32} 轮自主调查时间，但没有在上限内调用结构化结果工具。平台已停止自动重试。`,
+      detail: diagnosticDetail,
+      recoveryEvent: recovery[0],
+      recoveryLabel: recovery[1],
+    };
+  }
   if (code === "agent.step_budget_exhausted") {
     return {
       title: "开发工程师未能在步骤上限内完成",
@@ -672,13 +737,18 @@ function failureDiagnostic(
     };
   }
   if (code === "agent.invalid_output") {
+    const reviewFailure = run?.role === "review";
     return {
-      title: "开发工程师的输出未通过平台校验",
+      title: reviewFailure
+        ? "代码评审输出未通过平台校验"
+        : "开发工程师的输出未通过平台校验",
       summary:
-        "Agent 没有返回平台可执行的结构化结果；旧记录可能是步骤耗尽或连续输出格式错误。",
+        "Agent 没有返回平台可执行的结构化结果；平台会先在原任务阶段自动重试结构化输出。",
       detail,
-      recoveryEvent: "retry_development",
-      recoveryLabel: "建议：从开发重试；若再次失败，查看下方完整错误详情",
+      recoveryEvent: reviewFailure ? "retry_review" : "retry_development",
+      recoveryLabel: reviewFailure
+        ? "建议：重新执行代码评审，无需重跑开发"
+        : "建议：从开发重试；若再次失败，查看下方完整错误详情",
     };
   }
   if (code === "agent.invalid_action") {
@@ -710,6 +780,16 @@ function failureDiagnostic(
       recoveryLabel: "建议：确认包仓库可访问后，从开发重试",
     };
   }
+  if (code === "model.missing_api_key") {
+    return {
+      title: "模型 API Key 未配置",
+      summary:
+        "对应角色已配置为真实模型，但 Agent Worker 没有读取到共享或角色专用 API Key。",
+      detail,
+      recoveryEvent: "retry_development",
+      recoveryLabel: "建议：加载 .env.local 重启 Agent Worker 后，从开发重试",
+    };
+  }
   if (code.startsWith("model.")) {
     return {
       title: "模型服务调用失败",
@@ -720,12 +800,30 @@ function failureDiagnostic(
     };
   }
   if (code.startsWith("git.")) {
+    const recovery =
+      transition?.from_status === "clarifying" ||
+      transition?.from_status === "awaiting_clarification"
+        ? ["retry_clarification", "建议：重新获取仓库信息并继续需求澄清"]
+        : transition?.from_status === "planning" ||
+            transition?.from_status === "replanning" ||
+            transition?.from_status === "awaiting_plan"
+          ? ["retry_planning", "建议：重新获取仓库信息并继续方案设计"]
+          : transition?.from_status === "reviewing"
+            ? ["retry_review", "建议：检查仓库状态后重新执行代码评审"]
+            : transition?.from_status === "accepting"
+              ? ["retry_acceptance", "建议：检查仓库状态后重新准备验收"]
+              : transition?.from_status === "regression"
+                ? ["retry_regression", "建议：检查仓库状态后重新执行组合回归"]
+                : transition?.from_status === "merging" ||
+                    transition?.from_status === "awaiting_merge"
+                  ? ["retry_merge", "建议：检查仓库状态后重新准备合并"]
+                  : ["retry_development", "建议：检查仓库状态后重新准备开发"];
     return {
       title: "仓库自动化执行失败",
       summary: "平台在准备、提交或发布代码时遇到 Git 错误。",
       detail,
-      recoveryEvent: "retry_development",
-      recoveryLabel: "建议：检查仓库状态后重新准备开发",
+      recoveryEvent: recovery[0],
+      recoveryLabel: recovery[1],
     };
   }
   return {
@@ -2199,7 +2297,9 @@ function RequirementDrawer({
     ],
     awaiting_merge: [["begin_merge", "确认合并下一仓"]],
     blocked: [
+      ["retry_clarification", "重试需求澄清"],
       ["retry_development", "从开发重试"],
+      ["retry_review", "重试代码评审"],
       ["retry_planning", "从方案重试"],
       ["retry_acceptance", "从验收重试"],
       ["retry_regression", "重新组合回归"],
@@ -2578,7 +2678,7 @@ function RequirementDrawer({
                     <div>
                       <b>需求提出者</b>
                       <small>
-                        {new Date(entry.created_at).toLocaleString("zh-CN")}
+                        {parseApiTimestamp(entry.created_at).toLocaleString("zh-CN")}
                       </small>
                     </div>
                     <p>{entry.body}</p>
@@ -2782,7 +2882,12 @@ function RequirementDrawer({
             <div className="decision-actions">
               {(actions[item.status] ?? [])
                 .filter(
-                  ([event]) => event !== "begin_merge" || canBeginMerge,
+                  ([event]) =>
+                    (event !== "begin_merge" || canBeginMerge) &&
+                    (event !== "retry_clarification" ||
+                      latestFailedRun?.role === "clarify" ||
+                      blockedDiagnostic?.recoveryEvent ===
+                        "retry_clarification"),
                 )
                 .map(([event, label]) => (
                 <button
@@ -2941,7 +3046,7 @@ function RequirementDrawer({
                       )}
                       <small>
                         {entry.actor_type} ·{" "}
-                        {new Date(entry.created_at).toLocaleString("zh-CN")}
+                        {parseApiTimestamp(entry.created_at).toLocaleString("zh-CN")}
                       </small>
                     </div>
                   </article>
@@ -2989,7 +3094,13 @@ function ArchitectureReview({
           <p className="eyebrow">ARCHITECTURE REVIEW</p>
           <h3>实现方案评审</h3>
         </div>
-        <span>系统架构师 · v{artifact.version}</span>
+        <span>
+          系统架构师 · v{artifact.version} ·{" "}
+          {typeof plan.confidence === "number"
+            ? `方案置信度 ${plan.confidence}%`
+            : "方案置信度未提供"}{" "}
+          · 需人工审核
+        </span>
       </div>
       <div className="architecture-summary">
         <div>
@@ -3056,7 +3167,7 @@ function ArchitectureReview({
               <div>
                 <b>项目负责人</b>
                 <small>
-                  {new Date(entry.created_at).toLocaleString("zh-CN")}
+                  {parseApiTimestamp(entry.created_at).toLocaleString("zh-CN")}
                 </small>
               </div>
               <p>{entry.body}</p>
@@ -3066,7 +3177,7 @@ function ArchitectureReview({
       )}
       <div className="plan-approval">
         <p className="eyebrow">开工授权</p>
-        <h4>批准后，开发工程师将按此方案修改并测试代码</h4>
+        <h4>本方案未达到自动批准条件，需要人工确认后再开始开发</h4>
         <p>如需退回，请写明需要修改的范围、约束或风险处理方式。</p>
         <label>
           审批意见

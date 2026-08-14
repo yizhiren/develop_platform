@@ -70,12 +70,24 @@ def _add_requirement_attachments(connection: Connection) -> None:
     RequirementAttachment.__table__.create(connection, checkfirst=True)
 
 
+def _add_agent_diagnostics(connection: Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql("PRAGMA table_info(agent_runs)").fetchall()
+    }
+    if "diagnostics_json" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE agent_runs ADD COLUMN diagnostics_json TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
 MIGRATIONS = (
     Migration(1, "initial_schema", _initial_schema),
     Migration(2, "requirement_repository_pull_request_url", _add_pull_request_url),
     Migration(3, "agent_run_stable_identity", _add_agent_identity),
     Migration(4, "agent_run_error_message", _add_agent_error_message),
     Migration(5, "requirement_image_attachments", _add_requirement_attachments),
+    Migration(6, "agent_run_diagnostics", _add_agent_diagnostics),
 )
 
 

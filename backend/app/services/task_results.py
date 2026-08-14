@@ -76,7 +76,7 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
         task.lease_expires_at = None
         task.attempt_count += 1
         payload = json.loads(task.payload_json)
-        payload["_failure"] = {
+        failure = {
             "error_code": str(result.get("error_code", "worker.failed"))[:80],
             "error_message": safe_error_message(result.get("error_message", ""), 3_800),
             "changed_paths": [
@@ -87,6 +87,10 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
             if isinstance(result.get("changed_paths"), list)
             else [],
         }
+        diagnostics = _safe_agent_diagnostics(result.get("diagnostics"))
+        if diagnostics:
+            failure["diagnostics"] = diagnostics
+        payload["_failure"] = failure
         task.payload_json = json.dumps(payload, ensure_ascii=False)
         if run:
             run.status = "failed"
@@ -94,6 +98,10 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
                 run.model = str(result["model"])[:120]
             run.error_code = result.get("error_code", "worker.failed")
             run.error_message = _failure_reason(result)
+            run.diagnostics_json = json.dumps(
+                _safe_agent_diagnostics(result.get("diagnostics")),
+                ensure_ascii=False,
+            )
             run.token_usage = int(result.get("token_usage", 0))
             run.completed_at = datetime.now(UTC)
         if result.get("retryable") and task.attempt_count < get_settings().task_max_attempts:
@@ -156,7 +164,15 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
         elif task.task_type.startswith("agent."):
             requirement = session.get(Requirement, task.requirement_id)
             if requirement:
-                transition_requirement(session, requirement, "technical_failure", requirement.version, "worker", None, _failure_reason(result))
+                transition_requirement(
+                    session,
+                    requirement,
+                    "technical_failure",
+                    requirement.version,
+                    "worker",
+                    run.id if run else None,
+                    _failure_reason(result),
+                )
         return
 
     output = dict(result.get("output") or {})
@@ -171,6 +187,10 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
         if result.get("model"):
             run.model = str(result["model"])[:120]
         run.output_json = json.dumps(output, ensure_ascii=False)
+        run.diagnostics_json = json.dumps(
+            _safe_agent_diagnostics(result.get("diagnostics")),
+            ensure_ascii=False,
+        )
         run.token_usage = int(result.get("token_usage", 0))
         run.completed_at = datetime.now(UTC)
 
@@ -269,6 +289,35 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
             reason=str(output.get("summary", "")),
             task_context=task_context,
         )
+        if task.task_type == "agent.architect":
+            _auto_approve_architecture_plan(session, requirement, output)
+
+
+def _auto_approve_architecture_plan(
+    session: Session,
+    requirement: Requirement,
+    output: dict[str, Any],
+) -> None:
+    confidence = output.get("confidence")
+    # Runtime schema validation guarantees an integer for new artifacts. Keep
+    # historical/malformed artifacts on the safer manual-review path.
+    if type(confidence) is not int:
+        return
+    threshold = get_settings().architecture_auto_approve_confidence_threshold
+    if confidence <= threshold:
+        return
+    transition_requirement(
+        session,
+        requirement,
+        "confirm_plan",
+        requirement.version,
+        actor_type="system",
+        actor_id=None,
+        reason=(
+            f"方案置信度 {confidence}% 高于自动批准阈值 {threshold}%，"
+            "平台自动批准并开始开发"
+        ),
+    )
 
 
 def _mark_task_running(
@@ -306,6 +355,32 @@ def _failure_reason(result: dict[str, Any]) -> str:
     code = str(result.get("error_code", "worker.failed")).strip()[:80]
     message = safe_error_message(result.get("error_message", ""), 3_800)
     return f"{code}: {message}" if message and message != code else code
+
+
+def _safe_agent_diagnostics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("turns", "max_turns", "tool_calls", "tool_errors"):
+        try:
+            result[key] = min(max(int(value.get(key) or 0), 0), 2**31 - 1)
+        except (TypeError, ValueError):
+            result[key] = 0
+    result["last_stop_reason"] = str(value.get("last_stop_reason") or "")[:80]
+    result["terminal_tool_called"] = bool(value.get("terminal_tool_called"))
+    counts = value.get("tool_call_counts")
+    if isinstance(counts, dict):
+        safe_counts: dict[str, int] = {}
+        for name, count in list(counts.items())[:100]:
+            safe_name = str(name).strip()[:64]
+            if not safe_name:
+                continue
+            try:
+                safe_counts[safe_name] = min(max(int(count or 0), 0), 2**31 - 1)
+            except (TypeError, ValueError):
+                safe_counts[safe_name] = 0
+        result["tool_call_counts"] = safe_counts
+    return result
 
 
 def _enforce_acceptance_evidence_gate(task: WorkflowTask, output: dict[str, Any]) -> None:

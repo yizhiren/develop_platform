@@ -9,7 +9,7 @@ flowchart LR
   Redis <--> Agent[Agent Worker]
   Redis <--> Git[Git Worker]
   Redis <--> Dependency[Dependency Worker]
-  Agent -->|Unix Socket| Sandbox[断网 Sandbox Executor]
+  Agent -->|Unix Socket| Sandbox[隔离公网出口 Sandbox Executor]
   Git <--> GH[GitHub / GitLab]
   Dependency <--> Registry[npm / pnpm / Yarn Registry]
   HostSSH[主机 .ssh，只读] --> Git
@@ -28,7 +28,7 @@ flowchart LR
 - Agent Worker：无数据库权限；从 Redis 获取不可变任务，调用模型和受控工具，回传结构化结果。
 - Git Worker：唯一允许执行 Git 网络操作的可信 push/pull 容器；只读挂载主机 SSH 目录，执行 clone/fetch/branch/commit/push，并通过 Provider API 创建 PR/MR、查询 CI 和合并。
 - Dependency Worker：在工作区准备完成后联网执行锁文件驱动的 Node 依赖安装。它不挂载 SSH、Provider Secret、模型 Key、数据库或 Docker Socket；默认禁用依赖生命周期脚本，并将下载缓存保存在独立 Volume。成功后开发任务才会投递给断网 Agent/Sandbox。
-- Sandbox Executor：通过 Unix Socket 接收已经过 Agent Worker 校验的测试命令；容器使用 `network_mode: none`、非 root、只读根文件系统、无 Docker Socket、无平台数据库和 Git/模型凭据，并施加目录、命令、输出大小、超时和进程资源限制。它是共享执行服务，不是每需求临时创建一个容器。
+- Sandbox Executor：通过 Unix Socket 接收已经过 Agent Worker 校验的开发与验收命令；容器连接仅供公网出口的隔离网络，不连接应用内部网络，并保持非 root、只读根文件系统、无 Docker Socket、无平台数据库和 Git/模型凭据，以及目录、输出大小、超时和进程资源限制。它允许 Agent 执行任意 npm 命令与 grep/rg 搜索。
 - Provider Secret Store：独立 Docker Volume，不进入 SQLite、备份、Web 或 Agent。系统管理员通过 Control Plane 的 write-only 管理 API 原子替换 `0600` Token 文件；目录权限为 `0700`。Git Worker 以只读挂载在每次 Provider 任务开始时动态读取，因此页面配置无需重启服务。
 - Redis：任务与事件传输；不是权威状态源。
 - Artifact：结构化规格、方案、开发/评审/验收报告和 Git manifest 版本化存入 SQLite；超过内联阈值的完整 Diff 按 SHA-256 内容寻址写入 Artifact Volume，SQLite `evidence` 只保存路径、摘要、大小和归属，并通过项目 RBAC 下载。

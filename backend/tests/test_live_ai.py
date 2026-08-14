@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from app.agents.acceptance import AcceptanceToolLoop
+from app.agents.clarification import PiClarificationToolLoop
+from app.agents.pi_bridge import PiAgentCoreBridge
 from app.agents.providers import OpenAICompatibleProvider
 from app.agents.coding import DeveloperToolLoop
 from app.agents.runtime import AgentRuntime, ROLE_SCHEMAS
@@ -68,6 +70,65 @@ async def test_each_configured_agent_profile_reaches_its_model(agent_key: str, r
     )
     assert isinstance(output, ROLE_SCHEMAS[role])
     assert response.model
+
+
+async def test_deepseek_pi_clarifier_reads_repository_before_asking_questions(
+    tmp_path: Path,
+) -> None:
+    runtime = build_runtimes()["agent1"]
+    assert isinstance(runtime.provider, OpenAICompatibleProvider)
+    workspace_root = tmp_path / "workspaces"
+    analysis_root = workspace_root / "live-pi-analysis"
+    repository = analysis_root / "repo-1"
+    repository.mkdir(parents=True)
+    (repository / "package.json").write_text(
+        '{"scripts":{"test":"node --test"},"engines":{"node":">=22"}}'
+    )
+    (repository / ".github" / "workflows").mkdir(parents=True)
+    (repository / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs:\n  test:\n    steps:\n      - run: npm test\n"
+    )
+    context = {
+        "requirement_id": "live-pi-clarifier-1",
+        "title": "修复 CI 测试步骤",
+        "description": (
+            "CI 必须使用仓库现有测试脚本并在 Node 22 下通过。技术事实从仓库读取；"
+            "若这些信息已充分，不要向用户提问。"
+        ),
+        "repositories": [{"repository_id": "repo-1", "full_name": "local/pi-test"}],
+        "artifacts": {
+            "repository_analysis": {
+                "schema_version": "1.0",
+                "source": "trusted_read_only_checkout",
+                "workspace_root": str(analysis_root),
+                "repositories": [
+                    {
+                        "repository_id": "repo-1",
+                        "relative_path": "repo-1",
+                        "full_name": "local/pi-test",
+                        "head_sha": "test-sha",
+                        "file_tree": ["package.json", ".github/workflows/ci.yml"],
+                    }
+                ],
+            }
+        },
+    }
+    bridge = PiAgentCoreBridge(
+        Path(os.getenv("PI_AGENT_CORE_BRIDGE_PATH", "/srv/pi-bridge/bridge.mjs")),
+        timeout_seconds=int(os.getenv("PI_AGENT_CORE_TIMEOUT_SECONDS", "240")),
+    )
+
+    report, response = await PiClarificationToolLoop(
+        runtime.provider,
+        bridge,
+        workspace_root,
+        max_turns=8,
+    ).run(context)
+
+    assert report.repository_ids == ["repo-1"]
+    assert any("npm" in item.lower() or "node" in item.lower() for item in report.dependencies)
+    assert response.model
+    assert response.prompt_tokens + response.completion_tokens > 0
 
 
 async def test_deepseek_developer_tool_loop_changes_code_and_runs_tests(

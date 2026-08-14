@@ -67,19 +67,20 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-fake}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
-      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-openai}
-      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-gpt-5.6-sol}
-      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-openai}
-      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-gpt-5.6-sol}
+      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-deepseek}
+      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-deepseek-v4-flash}
+      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-deepseek}
+      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-deepseek-v4-flash}
       AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-deepseek}
       AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-https://api.deepseek.com}
-      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-pro}
-      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-openai}
-      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-gpt-5.6-sol}
+      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-flash}
+      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-deepseek}
+      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-deepseek-v4-flash}
       REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+      ARCHITECTURE_AUTO_APPROVE_CONFIDENCE_THRESHOLD: ${ARCHITECTURE_AUTO_APPROVE_CONFIDENCE_THRESHOLD:-90}
       # Non-secret capability flags. Provider tokens remain isolated in Git Worker.
       GITHUB_API_ENABLED: ${GITHUB_TOKEN:+1}
       GITLAB_API_ENABLED: ${GITLAB_TOKEN:+1}
@@ -115,23 +116,30 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-openai}
-      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-gpt-5.6-sol}
+      AGENT1_LLM_PROVIDER: ${AGENT1_LLM_PROVIDER:-deepseek}
+      AGENT1_LLM_BASE_URL: ${AGENT1_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT1_LLM_MODEL: ${AGENT1_LLM_MODEL:-deepseek-v4-flash}
       AGENT1_LLM_API_KEY: ${AGENT1_LLM_API_KEY:-}
-      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-openai}
-      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-gpt-5.6-sol}
+      AGENT2_LLM_PROVIDER: ${AGENT2_LLM_PROVIDER:-deepseek}
+      AGENT2_LLM_BASE_URL: ${AGENT2_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT2_LLM_MODEL: ${AGENT2_LLM_MODEL:-deepseek-v4-flash}
       AGENT2_LLM_API_KEY: ${AGENT2_LLM_API_KEY:-}
       AGENT3_LLM_PROVIDER: ${AGENT3_LLM_PROVIDER:-deepseek}
       AGENT3_LLM_BASE_URL: ${AGENT3_LLM_BASE_URL:-https://api.deepseek.com}
-      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-pro}
+      AGENT3_LLM_MODEL: ${AGENT3_LLM_MODEL:-deepseek-v4-flash}
       AGENT3_LLM_API_KEY: ${AGENT3_LLM_API_KEY:-}
-      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-openai}
-      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.openai.com/v1}
-      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-gpt-5.6-sol}
+      AGENT4_LLM_PROVIDER: ${AGENT4_LLM_PROVIDER:-deepseek}
+      AGENT4_LLM_BASE_URL: ${AGENT4_LLM_BASE_URL:-https://api.deepseek.com}
+      AGENT4_LLM_MODEL: ${AGENT4_LLM_MODEL:-deepseek-v4-flash}
       AGENT4_LLM_API_KEY: ${AGENT4_LLM_API_KEY:-}
       REPOSITORY_AUTOMATION_ENABLED: ${REPOSITORY_AUTOMATION_ENABLED:-0}
+      PI_AGENT_CORE_ENABLED: ${PI_AGENT_CORE_ENABLED:-1}
+      PI_AGENT_CORE_BRIDGE_PATH: /srv/pi-bridge/bridge.mjs
+      PI_AGENT_CORE_TIMEOUT_SECONDS: ${PI_AGENT_CORE_TIMEOUT_SECONDS:-900}
+      PI_CLARIFIER_MAX_TURNS: ${PI_CLARIFIER_MAX_TURNS:-32}
+      PI_STRUCTURED_ROLE_MAX_TURNS: ${PI_STRUCTURED_ROLE_MAX_TURNS:-32}
+      PI_ACCEPTANCE_MAX_TURNS: ${PI_ACCEPTANCE_MAX_TURNS:-32}
+      PI_DEVELOPER_MAX_TURNS: ${PI_DEVELOPER_MAX_TURNS:-32}
       WORKSPACE_ROOT: /workspaces
       SANDBOX_EXECUTOR_SOCKET: /runtime/sandbox.sock
       MAX_PARALLEL_REQUIREMENTS: ${MAX_PARALLEL_REQUIREMENTS:-2}
@@ -159,8 +167,14 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    # Limit the executor cgroup as a whole instead of imposing RLIMIT_AS on
+    # each child. Node/WebAssembly reserves large virtual address ranges even
+    # when resident memory is modest, so a 2 GiB address-space cap caused
+    # false OOM failures in otherwise healthy npm test suites.
+    mem_limit: ${SANDBOX_EXECUTOR_MEMORY_LIMIT:-6g}
     command: ["python", "-m", "app.sandbox_executor"]
-    network_mode: "none"
+    networks:
+      - sandbox-egress
     environment:
       WORKSPACE_ROOT: /workspaces
       SANDBOX_EXECUTOR_SOCKET: /runtime/sandbox.sock
@@ -320,3 +334,6 @@ volumes:
   sandbox-runtime:
   provider-secrets:
   dependency-cache:
+
+networks:
+  sandbox-egress:

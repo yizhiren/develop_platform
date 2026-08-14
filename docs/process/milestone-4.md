@@ -11,7 +11,7 @@
 
 1. 方案前可信仓库分析：Git Worker 对目标分支 fresh clone，固化 head SHA、受限文件树、类型统计和关键文本摘录，再启动 Agent2。
 2. 逐仓组合回归：非末仓合并后构造“已合并目标分支 + 未合并交付分支”干净 checkout，平台复跑测试并由 Agent4 判断；失败阻断后续合并。
-3. 断网 Sandbox Executor：Agent Worker 只负责模型与策略，测试命令通过 Unix Socket 进入 `network_mode: none` 容器；不挂载 DB、Docker Socket 或 Secret。
+3. Sandbox Executor：Agent Worker 只负责模型与策略，测试命令通过 Unix Socket 进入隔离执行容器；当前实现已改为仅连接独立公网出口网络，仍不挂载 DB、Docker Socket 或 Secret。
 4. 分布式容量控制：Redis Lua 原子管理 task/requirement lock、全局活动需求 ZSET、心跳和 TTL，默认最多并行两个需求。
 5. 不可变大型证据：完整大 Diff 以 SHA-256 内容寻址写入 Artifact Volume，SQLite 记录元数据，UI 经 RBAC 展示和下载。
 6. 可重复恢复演练：真实子进程消费消息后被 `SIGKILL`，替代消费者 `XAUTOCLAIM` 并 ACK；另有真实 Redis 并发槽位演练。

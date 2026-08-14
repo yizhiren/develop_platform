@@ -21,6 +21,7 @@ class ModelResponse:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     model: str = ""
+    diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +110,7 @@ class FakeLLMProvider(LLMProvider):
             }
         elif "ArchitecturePlan" in system:
             payload = {
-                "schema_version": "1.0", "current_state": "已分析",
+                "schema_version": "1.0", "confidence": 90, "current_state": "已分析",
                 "target_architecture": "按现有模块边界实现", "data_flow": [],
                 "public_interface_changes": [], "database_changes": [], "repositories": [],
                 "security_considerations": ["保持最小权限"],

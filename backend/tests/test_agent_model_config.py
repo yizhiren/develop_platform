@@ -1,3 +1,4 @@
+from hmac import compare_digest
 from pathlib import Path
 
 import pytest
@@ -5,6 +6,25 @@ import pytest
 from app.agents.providers import FakeLLMProvider, OpenAICompatibleProvider
 from app.core.config import Settings
 from app.worker import build_runtimes
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model profile tests must not consume credentials from the invoking shell."""
+    shared = {
+        "LLM_PROVIDER",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_API_KEY_FILE",
+    }
+    per_role = {
+        f"AGENT{index}_LLM_{suffix}"
+        for index in range(1, 5)
+        for suffix in ("PROVIDER", "BASE_URL", "MODEL", "API_KEY", "API_KEY_FILE")
+    }
+    for name in shared | per_role:
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_agent_model_profiles_inherit_shared_values_and_allow_overrides() -> None:
@@ -55,6 +75,15 @@ def test_agent_model_profiles_inherit_shared_values_and_allow_overrides() -> Non
         settings.agent_model_config("agent5")
 
 
+def test_all_pi_roles_default_to_thirty_two_turns() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.pi_clarifier_max_turns == 32
+    assert settings.pi_structured_role_max_turns == 32
+    assert settings.pi_acceptance_max_turns == 32
+    assert settings.pi_developer_max_turns == 32
+
+
 def test_worker_builds_four_runtimes_and_reads_shared_key_file_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -93,8 +122,10 @@ def test_worker_builds_four_runtimes_and_reads_shared_key_file_once(
     assert isinstance(runtimes["agent2"].provider, OpenAICompatibleProvider)
     assert isinstance(runtimes["agent3"].provider, FakeLLMProvider)
     assert isinstance(runtimes["agent4"].provider, OpenAICompatibleProvider)
-    assert runtimes["agent1"].provider.api_key == "shared-secret"
-    assert runtimes["agent2"].provider.api_key == "architect-secret"
+    # compare_digest prevents pytest assertion rewriting from echoing a real
+    # environment credential if this isolation ever regresses.
+    assert compare_digest(runtimes["agent1"].provider.api_key, "shared-secret")
+    assert compare_digest(runtimes["agent2"].provider.api_key, "architect-secret")
     assert runtimes["agent2"].provider.model == "architect-model"
     assert runtimes["agent2"].provider.thinking_enabled is None
     assert runtimes["agent2"].provider.reasoning_effort == "none"

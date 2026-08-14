@@ -1,5 +1,7 @@
 # API 约定
 
+- 所有响应时间戳均为 UTC RFC3339，并带 `Z` 后缀；历史 SQLite 无时区值也按 UTC 解释。
+
 - 基础路径：`/api/v1`。
 - JSON 字段使用 `snake_case`。
 - 时间使用 UTC ISO-8601。

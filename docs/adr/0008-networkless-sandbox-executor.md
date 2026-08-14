@@ -1,5 +1,7 @@
 # ADR-0008：断网 Sandbox Executor
 
+> 状态：已被 2026-08-15 的隔离公网出口方案取代。保留本文作为历史决策记录；当前行为见 `docs/architecture/agent-runtime.md`。
+
 - 状态：接受
 - 日期：2026-08-05
 

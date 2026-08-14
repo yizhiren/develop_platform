@@ -43,6 +43,7 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.CLARIFYING: {
+        "analysis_ready": TransitionRule(RequirementStatus.CLARIFYING, "agent.clarify"),
         "clarification_ready": TransitionRule(RequirementStatus.AWAITING_CLARIFICATION),
         "clarification_complete": TransitionRule(RequirementStatus.PLANNING, "agent.architect"),
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
@@ -141,7 +142,9 @@ RULES: Final[dict[RequirementStatus, dict[str, TransitionRule]]] = {
         "cancel": TransitionRule(RequirementStatus.CANCELLED),
     },
     RequirementStatus.BLOCKED: {
+        "retry_clarification": TransitionRule(RequirementStatus.CLARIFYING, "agent.clarify"),
         "retry_development": TransitionRule(RequirementStatus.DEVELOPING, "agent.develop"),
+        "retry_review": TransitionRule(RequirementStatus.REVIEWING, "agent.review"),
         "retry_planning": TransitionRule(RequirementStatus.REPLANNING, "agent.revise"),
         "retry_acceptance": TransitionRule(RequirementStatus.ACCEPTING, "git.prepare_verification"),
         "retry_merge": TransitionRule(RequirementStatus.AWAITING_MERGE),
@@ -180,6 +183,42 @@ def transition_requirement(
         raise WorkflowError("architecture plan feedback is required")
     if event == "cancel" and not reason.strip():
         raise WorkflowError("closing reason is required")
+    if current == RequirementStatus.BLOCKED and event == "retry_clarification":
+        latest_failed_run = session.scalar(
+            select(AgentRun)
+            .where(
+                AgentRun.requirement_id == requirement.id,
+                AgentRun.status == "failed",
+            )
+            .order_by(AgentRun.created_at.desc())
+        )
+        latest_failed_task = session.scalar(
+            select(WorkflowTask)
+            .where(
+                WorkflowTask.requirement_id == requirement.id,
+                WorkflowTask.status == "failed",
+            )
+            .order_by(WorkflowTask.created_at.desc())
+        )
+        latest_blocked_transition = session.scalar(
+            select(WorkflowTransition)
+            .where(
+                WorkflowTransition.requirement_id == requirement.id,
+                WorkflowTransition.to_status == RequirementStatus.BLOCKED.value,
+            )
+            .order_by(WorkflowTransition.created_at.desc())
+        )
+        clarifier_failed = latest_failed_run is not None and latest_failed_run.role == "clarify"
+        clarification_analysis_failed = (
+            latest_failed_task is not None
+            and latest_failed_task.task_type == "git.prepare_analysis"
+            and latest_blocked_transition is not None
+            and latest_blocked_transition.from_status == RequirementStatus.CLARIFYING.value
+        )
+        if not clarifier_failed and not clarification_analysis_failed:
+            raise WorkflowError(
+                "retry_clarification requires a failed clarifier or clarification repository analysis"
+            )
     if current == RequirementStatus.AWAITING_CLARIFICATION and event == "confirm_clarification":
         clarification = session.scalar(
             select(ArtifactVersion)
@@ -213,9 +252,37 @@ def transition_requirement(
 
     settings = get_settings()
     if settings.repository_automation_enabled:
-        if current == RequirementStatus.CLARIFYING and event == "clarification_complete":
+        if (
+            current == RequirementStatus.DRAFT
+            and event == "publish"
+            and _has_linked_repositories(session, requirement.id)
+        ):
+            rule = TransitionRule(RequirementStatus.CLARIFYING, "git.prepare_analysis")
+        elif (
+            current == RequirementStatus.AWAITING_CLARIFICATION
+            and event == "request_more_clarification"
+            and _has_linked_repositories(session, requirement.id)
+        ):
+            # Refresh on every human reply so Agent1 never receives a stale or
+            # already-cleaned analysis checkout.
+            rule = TransitionRule(RequirementStatus.CLARIFYING, "git.prepare_analysis")
+        elif (
+            current == RequirementStatus.BLOCKED
+            and event == "retry_clarification"
+            and _has_linked_repositories(session, requirement.id)
+        ):
+            rule = TransitionRule(RequirementStatus.CLARIFYING, "git.prepare_analysis")
+        elif (
+            current == RequirementStatus.CLARIFYING
+            and event == "clarification_complete"
+            and not _has_artifact(session, requirement.id, "repository_analysis")
+        ):
             rule = TransitionRule(RequirementStatus.PLANNING, "git.prepare_analysis")
-        elif current == RequirementStatus.AWAITING_CLARIFICATION and event == "confirm_clarification":
+        elif (
+            current == RequirementStatus.AWAITING_CLARIFICATION
+            and event == "confirm_clarification"
+            and not _has_usable_repository_analysis(session, requirement.id)
+        ):
             rule = TransitionRule(RequirementStatus.PLANNING, "git.prepare_analysis")
         elif current == RequirementStatus.AWAITING_PLAN and event == "confirm_plan":
             rule = TransitionRule(RequirementStatus.DEVELOPING, "git.prepare_workspaces")
@@ -329,7 +396,21 @@ def transition_requirement(
             # A previous rejection is feedback for the developer, not evidence for
             # the next independent review. Keeping it here anchors the reviewer on
             # stale findings even when the latest commit manifest proves otherwise.
-            context["artifacts"].pop("code_review_report", None)
+            for stale_kind in {
+                "acceptance_report",
+                "code_review_report",
+                "delivery_manifest",
+                "final_acceptance_report",
+                "final_verification_dependency_manifest",
+                "final_verification_manifest",
+                "incremental_regression_report",
+                "incremental_verification_dependency_manifest",
+                "incremental_verification_manifest",
+                "pull_request_manifest",
+                "verification_dependency_manifest",
+                "verification_manifest",
+            }:
+                context["artifacts"].pop(stale_kind, None)
             context["review_stage_policy"] = {
                 "stage": "pre_publish",
                 "publication_occurs_after_approval": True,
@@ -337,6 +418,12 @@ def transition_requirement(
                 "remote_verification_owner": "trusted_git_worker_and_acceptance",
                 "format_consistency_means": "preserve Markdown structure and style while allowing required content changes",
             }
+        elif role == "accept":
+            # Acceptance is an independent decision over the freshly prepared,
+            # SHA-verified checkout. A report from an older head is useful to the
+            # replanning/development loop, but including it here can anchor Agent4
+            # on failures that the current delivery has already fixed.
+            context["artifacts"].pop("acceptance_report", None)
         if task_context:
             context.update(task_context)
         agent_run = None
@@ -433,6 +520,43 @@ def _has_artifact(session: Session, requirement_id: str, kind: str) -> bool:
         )
         .limit(1)
     ) is not None
+
+
+def _has_linked_repositories(session: Session, requirement_id: str) -> bool:
+    return session.scalar(
+        select(RequirementRepository.id)
+        .where(RequirementRepository.requirement_id == requirement_id)
+        .limit(1)
+    ) is not None
+
+
+def _has_usable_repository_analysis(session: Session, requirement_id: str) -> bool:
+    artifact = session.scalar(
+        select(ArtifactVersion)
+        .where(
+            ArtifactVersion.requirement_id == requirement_id,
+            ArtifactVersion.kind == "repository_analysis",
+        )
+        .order_by(ArtifactVersion.version.desc())
+    )
+    if artifact is None:
+        return False
+    try:
+        content = json.loads(artifact.content_json)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    repositories = content.get("repositories") if isinstance(content, dict) else None
+    return bool(
+        isinstance(content, dict)
+        and content.get("workspace_root")
+        and isinstance(repositories, list)
+        and all(
+            isinstance(item, dict)
+            and item.get("repository_id")
+            and item.get("relative_path")
+            for item in repositories
+        )
+    )
 
 
 def _latest_development_failure(session: Session, requirement_id: str) -> dict:

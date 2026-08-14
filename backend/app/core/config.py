@@ -84,8 +84,20 @@ class Settings(BaseSettings):
     task_max_attempts: int = 3
     task_retry_base_seconds: int = 2
     max_parallel_requirements: int = 2
+    architecture_auto_approve_confidence_threshold: int = Field(
+        default=90,
+        ge=0,
+        le=100,
+    )
     repository_automation_enabled: bool = False
     workspace_root: Path = Path("/workspaces")
+    pi_agent_core_enabled: bool = True
+    pi_agent_core_bridge_path: Path = Path("/srv/pi-bridge/bridge.mjs")
+    pi_agent_core_timeout_seconds: int = Field(default=900, ge=30, le=900)
+    pi_clarifier_max_turns: int = Field(default=32, ge=3, le=50)
+    pi_structured_role_max_turns: int = Field(default=32, ge=3, le=50)
+    pi_acceptance_max_turns: int = Field(default=32, ge=4, le=50)
+    pi_developer_max_turns: int = Field(default=32, ge=8, le=50)
     allow_local_git: bool = False
     workspace_max_bytes: int = 10 * 1024**3
     workspace_ttl_hours: int = 72

@@ -33,7 +33,18 @@ ROLE_SCHEMAS: dict[str, type[BaseModel]] = {
 
 
 class AgentOutputError(ValueError):
-    pass
+    code = "agent.invalid_output"
+    retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        token_usage: int = 0,
+        diagnostics: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.token_usage = token_usage
+        self.diagnostics = diagnostics
 
 
 class AgentRuntime:
@@ -58,12 +69,28 @@ class AgentRuntime:
         try:
             parsed = schema.model_validate_json(response.content)
         except ValidationError as exc:
-            repair_system = f"你是 JSON 修复器。把输入修复为符合下列 JSON Schema 的单个 JSON 对象，不得改变原意。\n{schema_json}"
+            validation_detail = _validation_error_summary(exc)
+            repair_system = (
+                "你是 JSON 修复器。把输入修复为符合下列 JSON Schema 的单个 JSON 对象，"
+                "不得改变原意。\n"
+                f"当前输出校验错误：\n{validation_detail}\n"
+                f"JSON Schema:\n{schema_json}"
+            )
             repaired = await self.provider.complete(repair_system, response.content)
             try:
                 parsed = schema.model_validate_json(repaired.content)
             except ValidationError as repair_exc:
-                raise AgentOutputError(f"agent output does not match {schema.__name__} after one repair") from repair_exc
+                total_tokens = (
+                    response.prompt_tokens
+                    + response.completion_tokens
+                    + repaired.prompt_tokens
+                    + repaired.completion_tokens
+                )
+                raise AgentOutputError(
+                    f"agent output does not match {schema.__name__} after one repair; "
+                    f"validation_errors={_validation_error_summary(repair_exc)}",
+                    token_usage=total_tokens,
+                ) from repair_exc
             response = ModelResponse(
                 content=repaired.content,
                 prompt_tokens=response.prompt_tokens + repaired.prompt_tokens,
@@ -114,6 +141,16 @@ def _context_without_attachment_paths(context: dict[str, Any]) -> dict[str, Any]
             for attachment in attachments
         ]
     return result
+
+
+def _validation_error_summary(exc: ValidationError) -> str:
+    details: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False)[:8]:
+        location = ".".join(str(value) for value in error.get("loc", ())) or "$"
+        details.append(
+            f"{location}:{error.get('type', 'invalid')}:{error.get('msg', 'invalid value')}"
+        )
+    return "; ".join(details)[:2_000]
 
 
 __all__ = ["AgentRuntime", "AgentOutputError", "ModelProviderError"]

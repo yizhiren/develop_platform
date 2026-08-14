@@ -25,7 +25,21 @@ class CommandResult:
 class WorkspaceSandbox:
     """Constrained filesystem/command surface exposed to the developer Agent."""
 
-    ALLOWED_EXECUTABLES = {"pytest", "python", "python3", "npm", "pnpm", "yarn", "npx", "node", "go", "cargo", "make"}
+    ALLOWED_EXECUTABLES = {
+        "pytest",
+        "python",
+        "python3",
+        "npm",
+        "pnpm",
+        "yarn",
+        "npx",
+        "node",
+        "go",
+        "cargo",
+        "make",
+        "grep",
+        "rg",
+    }
     ALLOWED_NPX_TOOLS = {"tsc", "eslint", "vitest", "jest", "prettier"}
     BLOCKED_ARGUMENTS = {
         "install",
@@ -40,6 +54,16 @@ class WorkspaceSandbox:
         "publish",
         "login",
         "config",
+    }
+    SEARCH_EXCLUDED_DIRECTORIES = {
+        ".git",
+        ".next",
+        ".pytest_cache",
+        ".venv",
+        "__pycache__",
+        "coverage",
+        "node_modules",
+        "venv",
     }
 
     def __init__(
@@ -75,6 +99,63 @@ class WorkspaceSandbox:
         if not path.is_file() or path.stat().st_size > self.max_file_bytes:
             raise SandboxViolation("file is missing or exceeds read limit")
         return path.read_text(encoding="utf-8", errors="replace")
+
+    def search_text(
+        self,
+        query: str,
+        relative: str = ".",
+        limit: int = 100,
+    ) -> list[dict[str, str | int]]:
+        """Search bounded workspace text files for a literal string."""
+        if not query or len(query.encode()) > 1_000:
+            raise SandboxViolation("search query must be between 1 and 1000 bytes")
+        if limit < 1 or limit > 500:
+            raise SandboxViolation("search result limit must be between 1 and 500")
+        base = self._path(relative)
+        if not base.exists():
+            raise SandboxViolation("search target does not exist")
+
+        candidates: list[Path] = []
+        if base.is_file() and not base.is_symlink():
+            candidates.append(base)
+        elif base.is_dir():
+            for directory, names, filenames in os.walk(base, followlinks=False):
+                names[:] = sorted(
+                    name
+                    for name in names
+                    if name not in self.SEARCH_EXCLUDED_DIRECTORIES
+                    and not (Path(directory) / name).is_symlink()
+                )
+                for filename in sorted(filenames):
+                    path = Path(directory) / filename
+                    if not path.is_symlink():
+                        candidates.append(path)
+        else:
+            raise SandboxViolation("search target is not a regular file or directory")
+
+        matches: list[dict[str, str | int]] = []
+        for path in candidates:
+            try:
+                if not path.is_file() or path.stat().st_size > self.max_file_bytes:
+                    continue
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "\x00" in content:
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if query not in line:
+                    continue
+                matches.append(
+                    {
+                        "path": path.relative_to(self.root).as_posix(),
+                        "line": line_number,
+                        "text": line[:500],
+                    }
+                )
+                if len(matches) >= limit:
+                    return matches
+        return matches
 
     def write_file(self, relative: str, content: str) -> None:
         encoded = content.encode()
@@ -123,14 +204,21 @@ class WorkspaceSandbox:
         updated = "".join(lines[: start_line - 1]) + replacement + "".join(lines[end_line:])
         self.write_file(relative, updated)
 
-    def delete_file(self, relative: str) -> None:
+    def delete_file(self, relative: str) -> bool:
         path = self._path(relative)
-        if not path.is_file() or ".git" in path.relative_to(self.root).parts:
+        if ".git" in path.relative_to(self.root).parts:
+            raise SandboxViolation("delete target is not an allowed file")
+        if not path.exists():
+            return False
+        if not path.is_file() or path.is_symlink():
             raise SandboxViolation("delete target is not an allowed file")
         path.unlink()
+        return True
 
-    def restore_file(self, relative: str) -> None:
-        """Restore one tracked file from the repository's current HEAD."""
+    def restore_file(self, relative: str, source: str = "HEAD") -> None:
+        """Restore one tracked file from a fixed, trusted repository revision."""
+        if source not in {"HEAD", "HEAD^"}:
+            raise SandboxViolation("restore source is not allowed")
         path = self._path(relative)
         if ".git" in path.relative_to(self.root).parts:
             raise SandboxViolation("Git metadata is read-only to agents")
@@ -141,7 +229,7 @@ class WorkspaceSandbox:
             raise SandboxViolation("restore target is not inside a Git repository")
         repository_relative = path.relative_to(repository).as_posix()
         completed = subprocess.run(
-            ["git", "restore", "--source=HEAD", "--", repository_relative],
+            ["git", "restore", f"--source={source}", "--", repository_relative],
             cwd=repository,
             env={
                 "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -170,17 +258,30 @@ class WorkspaceSandbox:
                 "node is allowed only as the built-in test runner (`node --test ...`); "
                 "use an existing npm/pnpm/yarn script for other repository commands"
             )
-        if any(argument.lower() in self.BLOCKED_ARGUMENTS for argument in argv[1:3]):
+        if executable in {"pnpm", "yarn"} and len(argv) > 1 and argv[1].lower() in {"exec", "dlx"}:
+            raise SandboxViolation(
+                "package-manager exec commands are not allowed; use a repository validation script "
+                "or an allowlisted local-only npx tool"
+            )
+        if executable != "npm" and any(
+            argument.lower() in self.BLOCKED_ARGUMENTS for argument in argv[1:3]
+        ):
             raise SandboxViolation("dependency or registry mutation is not allowed")
+        working_directory = self._path(cwd)
+        if not working_directory.is_dir():
+            raise SandboxViolation("command working directory is invalid")
         if executable == "npx":
             tool = next((item for item in argv[1:] if not item.startswith("-")), "")
             if tool not in self.ALLOWED_NPX_TOOLS or "@" in tool:
                 raise SandboxViolation("npx tool is not allowlisted")
+            search_roots = [working_directory, *working_directory.parents]
+            if not any(
+                root.is_relative_to(self.root) and (root / "node_modules" / ".bin" / tool).is_file()
+                for root in search_roots
+            ):
+                raise SandboxViolation("npx tool is not installed in the workspace")
             if "--no-install" not in argv[1:]:
                 argv = [argv[0], "--no-install", *argv[1:]]
-        working_directory = self._path(cwd)
-        if not working_directory.is_dir():
-            raise SandboxViolation("command working directory is invalid")
         if self.executor_socket is not None:
             return self._run_remote(argv, cwd, timeout)
         environment = {
@@ -256,11 +357,16 @@ class WorkspaceSandbox:
         raise SandboxViolation("sandbox executor socket is unavailable") from last_error
 
     def _path(self, relative: str) -> Path:
+        raw = Path(relative)
+        if raw.is_absolute() or ".git" in raw.parts:
+            raise SandboxViolation("Git metadata and absolute paths are not accessible to agents")
         candidate = (self.root / relative).resolve()
         try:
-            candidate.relative_to(self.root)
+            resolved_relative = candidate.relative_to(self.root)
         except ValueError as exc:
             raise SandboxViolation("path escapes workspace") from exc
+        if ".git" in resolved_relative.parts:
+            raise SandboxViolation("Git metadata and absolute paths are not accessible to agents")
         return candidate
 
 
@@ -280,6 +386,5 @@ def _command_file_size_limit(argv: list[str]) -> int:
 
 def _limit_process(max_file_size: int = 64 * 1024**2) -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
-    resource.setrlimit(resource.RLIMIT_AS, (2 * 1024**3, 2 * 1024**3))
     resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_size, max_file_size))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))

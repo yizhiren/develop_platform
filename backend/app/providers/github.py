@@ -60,25 +60,32 @@ class GitHubProvider(GitProvider):
         return PullRequestRef(number=int(data["number"]), url=str(data["html_url"]), head_sha=str(data["head"]["sha"]), state=str(data["state"]))
 
     async def get_checks(self, repository: str, sha: str) -> list[dict[str, Any]]:
-        check_runs_response = await self.client.get(
-            f"/repos/{repository}/commits/{sha}/check-runs"
+        workflow_runs_response = await self.client.get(
+            f"/repos/{repository}/actions/runs",
+            params={"head_sha": sha, "per_page": 100},
         )
-        checks_accessible = check_runs_response.status_code != 403
-        if checks_accessible:
-            if check_runs_response.status_code >= 400:
-                retryable = check_runs_response.status_code in {429, 500, 502, 503, 504}
+        actions_accessible = workflow_runs_response.status_code != 403
+        if actions_accessible:
+            if workflow_runs_response.status_code >= 400:
+                retryable = workflow_runs_response.status_code in {429, 500, 502, 503, 504}
                 raise GitProviderError(
-                    f"github.http_{check_runs_response.status_code}",
-                    _safe_message(check_runs_response),
+                    f"github.http_{workflow_runs_response.status_code}",
+                    _safe_message(workflow_runs_response),
                     retryable,
                 )
-            check_runs = check_runs_response.json()
+            workflow_runs = workflow_runs_response.json()
         else:
-            check_runs = {"check_runs": []}
+            workflow_runs = {"workflow_runs": []}
         combined_status = await self._json("GET", f"/repos/{repository}/commits/{sha}/status")
         checks = [
-            {"id": item["id"], "name": item["name"], "status": item["status"], "conclusion": item.get("conclusion"), "url": item.get("html_url")}
-            for item in check_runs.get("check_runs", [])
+            {
+                "id": f"actions:{item['id']}",
+                "name": item.get("name") or item.get("display_title") or "GitHub Actions",
+                "status": item.get("status"),
+                "conclusion": item.get("conclusion"),
+                "url": item.get("html_url"),
+            }
+            for item in workflow_runs.get("workflow_runs", [])
         ]
         checks.extend(
             {
@@ -90,15 +97,15 @@ class GitHubProvider(GitProvider):
             }
             for item in combined_status.get("statuses", [])
         )
-        if not checks_accessible:
+        if not actions_accessible:
             checks.append(
                 {
-                    "id": "github-check-runs-permission",
-                    "name": "GitHub required checks (validated by merge gate)",
+                    "id": "github-actions-permission",
+                    "name": "GitHub Actions workflows (validated by merge gate)",
                     "status": "completed",
                     "conclusion": "neutral",
                     "url": None,
-                    "warning": "check-runs API unavailable; PR clean state and GitHub branch protection will be enforced",
+                    "warning": "Actions API unavailable; PR clean state and GitHub branch protection will be enforced",
                 }
             )
         return checks

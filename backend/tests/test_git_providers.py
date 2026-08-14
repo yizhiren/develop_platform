@@ -40,15 +40,29 @@ async def test_gitlab_contract_create_branch_and_verify_webhook() -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_pr_lookup_is_owner_scoped_and_checks_include_commit_statuses() -> None:
+async def test_github_pr_lookup_is_owner_scoped_and_checks_include_actions_and_statuses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/acme/api/pulls" and request.method == "GET":
             assert dict(request.url.params)["head"] == "acme:forgeflow/req-1"
             return httpx.Response(200, json=[{"number": 7}])
         if request.url.path == "/repos/acme/api/pulls/7":
             return httpx.Response(200, json={"number": 7, "html_url": "https://example/pr/7", "head": {"sha": "abc"}, "state": "open"})
-        if request.url.path.endswith("/check-runs"):
-            return httpx.Response(200, json={"check_runs": [{"id": 1, "name": "unit", "status": "completed", "conclusion": "success"}]})
+        if request.url.path == "/repos/acme/api/actions/runs":
+            assert dict(request.url.params) == {"head_sha": "abc", "per_page": "100"}
+            return httpx.Response(
+                200,
+                json={
+                    "workflow_runs": [
+                        {
+                            "id": 1,
+                            "name": "unit",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "html_url": "https://example/actions/1",
+                        }
+                    ]
+                },
+            )
         if request.url.path.endswith("/status"):
             return httpx.Response(200, json={"statuses": [{"id": 2, "context": "security", "state": "success", "target_url": "https://example/check"}]})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
@@ -89,9 +103,9 @@ async def test_github_error_preserves_safe_structured_validation_detail() -> Non
 
 
 @pytest.mark.asyncio
-async def test_github_checks_fall_back_to_provider_enforced_merge_gate() -> None:
+async def test_github_actions_fall_back_to_provider_enforced_merge_gate() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/check-runs"):
+        if request.url.path.endswith("/actions/runs"):
             return httpx.Response(
                 403,
                 json={"message": "Resource not accessible by personal access token"},
@@ -104,12 +118,12 @@ async def test_github_checks_fall_back_to_provider_enforced_merge_gate() -> None
     checks = await provider.get_checks("acme/api", "abc")
     assert checks == [
         {
-            "id": "github-check-runs-permission",
-            "name": "GitHub required checks (validated by merge gate)",
+            "id": "github-actions-permission",
+            "name": "GitHub Actions workflows (validated by merge gate)",
             "status": "completed",
             "conclusion": "neutral",
             "url": None,
-            "warning": "check-runs API unavailable; PR clean state and GitHub branch protection will be enforced",
+            "warning": "Actions API unavailable; PR clean state and GitHub branch protection will be enforced",
         }
     ]
     await provider.close()

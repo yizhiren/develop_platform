@@ -1,11 +1,18 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_serializer
 
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("*", when_used="json", check_fields=False)
+    def serialize_utc_datetimes(self, value: Any) -> Any:
+        if not isinstance(value, datetime):
+            return value
+        aware = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        return aware.isoformat().replace("+00:00", "Z")
 
 
 class LoginRequest(BaseModel):
@@ -218,6 +225,11 @@ class RepositoryPlan(BaseModel):
 
 class ArchitecturePlan(BaseModel):
     schema_version: Literal["1.0"] = "1.0"
+    confidence: int = Field(
+        ge=0,
+        le=100,
+        description="方案基于需求与仓库证据可直接实施的校准置信度（0-100）",
+    )
     current_state: str
     target_architecture: str
     data_flow: list[str]

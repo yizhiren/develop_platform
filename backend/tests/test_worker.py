@@ -1,5 +1,6 @@
 import pytest
 
+from app.agents.providers import FakeLLMProvider, OpenAICompatibleProvider
 from app.agents.runtime import AgentOutputError
 from app.worker import (
     AcceptanceWorkspaceMissing,
@@ -7,6 +8,8 @@ from app.worker import (
     _agent_failure_result,
     _should_run_acceptance_tool_loop,
     _should_run_developer_tool_loop,
+    _should_run_pi_clarifier,
+    _should_run_pi_structured_role,
 )
 from app.services.task_progress import task_running_result
 
@@ -65,6 +68,46 @@ def test_legacy_acceptance_can_keep_protocol_only_runtime_without_workspace() ->
     assert _should_run_acceptance_tool_loop("accept", {"artifacts": {}}, False) is False
 
 
+def test_deepseek_clarifier_uses_pi_when_analysis_workspace_exists() -> None:
+    provider = OpenAICompatibleProvider("https://api.deepseek.com", "test", "deepseek")
+    context = {
+        "repositories": [{"repository_id": "repo-1"}],
+        "artifacts": {"repository_analysis": {"workspace_root": "/workspaces/req-analysis"}},
+    }
+
+    assert _should_run_pi_clarifier("clarify", context, provider, True, True) is True
+    assert _should_run_pi_clarifier("architect", context, provider, True, True) is False
+    assert _should_run_pi_clarifier("clarify", context, provider, False, True) is False
+    assert _should_run_pi_clarifier("clarify", context, FakeLLMProvider(), True, True) is False
+
+
+def test_repository_clarifier_requires_analysis_workspace_when_automation_is_enabled() -> None:
+    provider = OpenAICompatibleProvider("https://api.deepseek.com", "test", "deepseek")
+
+    with pytest.raises(AgentOutputError) as raised:
+        _should_run_pi_clarifier(
+            "clarify",
+            {"repositories": [{"repository_id": "repo-1"}], "artifacts": {}},
+            provider,
+            True,
+            True,
+        )
+
+    assert raised.value.code == "agent.clarification_workspace_missing"
+
+
+def test_agent2_structured_roles_use_pi_but_execution_roles_keep_their_safety_loops() -> None:
+    provider = OpenAICompatibleProvider("https://api.deepseek.com", "test", "deepseek")
+
+    assert _should_run_pi_structured_role("architect", provider, True) is True
+    assert _should_run_pi_structured_role("revise", provider, True) is True
+    assert _should_run_pi_structured_role("review", provider, True) is True
+    assert _should_run_pi_structured_role("develop", provider, True) is False
+    assert _should_run_pi_structured_role("accept", provider, True) is False
+    assert _should_run_pi_structured_role("architect", provider, False) is False
+    assert _should_run_pi_structured_role("architect", FakeLLMProvider(), True) is False
+
+
 def test_agent_failure_result_preserves_safe_diagnostic_details() -> None:
     exc = AgentOutputError("developer tool loop exhausted its step budget\n(actions=read_file,run_command)")
     exc.code = "agent.step_budget_exhausted"
@@ -78,6 +121,36 @@ def test_agent_failure_result_preserves_safe_diagnostic_details() -> None:
     assert result["token_usage"] == 123
     assert result["model"] == "deepseek-v4-flash"
     assert result["changed_paths"] == ["repo-1/value.py"]
+
+
+def test_generic_schema_failure_is_retryable_and_preserves_token_usage() -> None:
+    exc = AgentOutputError("output schema mismatch", token_usage=456)
+
+    result = _agent_failure_result("task-review", exc, "deepseek-v4-flash")
+
+    assert result["error_code"] == "agent.invalid_output"
+    assert result["retryable"] is True
+    assert result["token_usage"] == 456
+
+
+def test_agent_failure_result_preserves_structured_diagnostics() -> None:
+    exc = AgentOutputError(
+        "exhausted 50 turns",
+        token_usage=789,
+        diagnostics={"turns": 50, "max_turns": 50, "tool_calls": 31},
+    )
+    exc.code = "agent.pi_turn_budget_exhausted"
+    exc.retryable = False
+
+    result = _agent_failure_result("task-50", exc, "deepseek-v4-flash")
+
+    assert result["retryable"] is False
+    assert result["token_usage"] == 789
+    assert result["diagnostics"] == {
+        "turns": 50,
+        "max_turns": 50,
+        "tool_calls": 31,
+    }
 
 
 def test_running_result_contains_worker_lease_context() -> None:

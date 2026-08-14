@@ -49,7 +49,15 @@ async def test_workspace_commit_locally_then_publish_reviewed_sha(tmp_path: Path
     git("config", "user.email", "test@example.com", cwd=source)
     (source / "value.txt").write_text("before\n")
     (source / "README.md").write_text("# Calculator service\n")
-    git("add", "value.txt", "README.md", cwd=source)
+    (source / ".github" / "workflows").mkdir(parents=True)
+    (source / ".github" / "workflows" / "ci.yml").write_text(
+        "name: CI\non: [pull_request]\njobs: {}\n"
+    )
+    (source / "scripts" / "pipeline").mkdir(parents=True)
+    (source / "scripts" / "pipeline" / "selftest.ts").write_text(
+        "export const selftest = true\n"
+    )
+    git("add", "value.txt", "README.md", ".github", "scripts", cwd=source)
     git("commit", "-m", "initial", cwd=source)
     git("clone", "--bare", str(source), str(remote), cwd=tmp_path)
 
@@ -58,6 +66,7 @@ async def test_workspace_commit_locally_then_publish_reviewed_sha(tmp_path: Path
     context = {
         "requirement_id": "req-1",
         "title": "Change value",
+        "description": "Fix scripts/pipeline/selftest.ts in CI",
         "repositories": [{
             "requirement_repository_id": "link-1",
             "repository_id": "repo-1",
@@ -71,7 +80,13 @@ async def test_workspace_commit_locally_then_publish_reviewed_sha(tmp_path: Path
     analysis = manager.prepare_analysis(context)
     assert analysis["source"] == "trusted_read_only_checkout"
     assert "README.md" in analysis["repositories"][0]["file_tree"]
-    assert analysis["repositories"][0]["selected_files"][0]["content"].startswith("# Calculator")
+    selected_files = {
+        item["path"]: item
+        for item in analysis["repositories"][0]["selected_files"]
+    }
+    assert selected_files["README.md"]["content"].startswith("# Calculator")
+    assert selected_files[".github/workflows/ci.yml"]["selection_reason"] == "repository_baseline"
+    assert selected_files["scripts/pipeline/selftest.ts"]["selection_reason"] == "requirement_reference"
     manifest = manager.prepare(context)
     checkout = Path(manifest["workspace_root"]) / "repo-1"
     (checkout / "value.txt").write_text("after\n")
@@ -203,6 +218,61 @@ def test_commit_only_copies_agent_changed_files_not_validation_outputs(tmp_path:
     assert "+after" in result["combined_diff"]
     assert "validation output" not in result["combined_diff"]
     assert (checkout / "generated.js").read_text() == "generated before\n"
+
+
+def test_rework_commit_preserves_unpublished_prior_reviewed_commit(tmp_path: Path) -> None:
+    _, remote = prepare_local_repository(tmp_path)
+    settings = Settings(_env_file=None, workspace_root=tmp_path / "workspaces", allow_local_git=True)
+    manager = GitWorkspaceManager(settings)
+    context = {
+        "requirement_id": "req-rework",
+        "title": "Cumulative rework",
+        "repositories": [{
+            "requirement_repository_id": "link-1",
+            "repository_id": "repo-1",
+            "provider": "github",
+            "full_name": "acme/repo",
+            "clone_url": remote.as_uri(),
+            "target_branch": "main",
+        }],
+        "artifacts": {},
+    }
+    manifest = manager.prepare(context)
+    checkout = Path(manifest["workspace_root"]) / "repo-1"
+    (checkout / "value.txt").write_text("first rework\n")
+    (checkout / "generated.js").unlink()
+    context["artifacts"]["workspace_manifest"] = manifest
+    context["artifacts"]["development_report"] = {
+        "repositories_changed": ["repo-1"],
+        "files_changed": ["repo-1/value.txt", "repo-1/generated.js"],
+    }
+
+    first = manager.commit(context)
+    first_head = first["repositories"][0]["head_sha"]
+    assert git("rev-parse", "HEAD", cwd=checkout) == first_head
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/heads/huaban/req-req-rework"],
+        cwd=remote,
+        capture_output=True,
+    ).returncode != 0
+
+    context["artifacts"]["development_commit_manifest"] = first
+    context["artifacts"]["development_report"] = {
+        "repositories_changed": ["repo-1"],
+        "files_changed": ["repo-1/regression.test.py"],
+    }
+    (checkout / "regression.test.py").write_text("assert True\n")
+
+    second = manager.commit(context)
+    second_head = second["repositories"][0]["head_sha"]
+
+    assert git("rev-parse", f"{second_head}^", cwd=checkout) == first_head
+    assert (checkout / "value.txt").read_text() == "first rework\n"
+    assert not (checkout / "generated.js").exists()
+    assert (checkout / "regression.test.py").read_text() == "assert True\n"
+    assert "first rework" in second["combined_diff"]
+    assert "generated.js" in second["combined_diff"]
+    assert "regression.test.py" in second["combined_diff"]
 
 
 def test_commit_rejects_nonignored_untracked_symlink(tmp_path: Path) -> None:

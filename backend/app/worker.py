@@ -8,10 +8,15 @@ from pathlib import Path
 from redis.asyncio import Redis
 
 from .agents.acceptance import ACCEPTANCE_ROLES, AcceptanceToolLoop, verification_manifest
+from .agents.clarification import ClarificationWorkspaceMissing, PiClarificationToolLoop
+from .agents.pi_bridge import PiAgentCoreBridge
+from .agents.pi_acceptance import PiAcceptanceToolLoop
+from .agents.pi_developer import PiDeveloperToolLoop
 from .agents.providers import FakeLLMProvider, OpenAICompatibleProvider
 from .agents.coding import DeveloperToolLoop
 from .agents.roles import AGENT_KEYS, agent_key_for_role
 from .agents.runtime import AgentOutputError, AgentRuntime, ModelProviderError
+from .agents.structured import PI_STRUCTURED_ROLES, PiStructuredRoleLoop
 from .agents.verification import run_recorded_tests
 from .core.config import get_settings
 from .services.leases import TaskLease
@@ -47,6 +52,9 @@ def _agent_failure_result(task_id: str, exc: Exception, model: str = "") -> dict
     }
     if model:
         result["model"] = model
+    diagnostics = getattr(exc, "diagnostics", None)
+    if isinstance(diagnostics, dict):
+        result["diagnostics"] = diagnostics
     changed_paths = getattr(exc, "changed_paths", None)
     if isinstance(changed_paths, list):
         result["changed_paths"] = [str(path)[:1_000] for path in changed_paths[:200]]
@@ -141,6 +149,40 @@ def _should_run_acceptance_tool_loop(
     return has_workspace
 
 
+def _should_run_pi_clarifier(
+    role: str,
+    context: dict,
+    provider: object,
+    enabled: bool,
+    repository_automation_enabled: bool,
+) -> bool:
+    if role != "clarify" or not enabled or not isinstance(provider, OpenAICompatibleProvider):
+        return False
+    repositories = context.get("repositories")
+    has_repositories = isinstance(repositories, list) and bool(repositories)
+    analysis = context.get("artifacts", {}).get("repository_analysis")
+    has_workspace = isinstance(analysis, dict) and bool(analysis.get("workspace_root"))
+    if has_repositories and not has_workspace:
+        if repository_automation_enabled:
+            raise ClarificationWorkspaceMissing(
+                "repository automation requires a fresh read-only workspace for Agent1"
+            )
+        return False
+    return True
+
+
+def _should_run_pi_structured_role(
+    role: str,
+    provider: object,
+    enabled: bool,
+) -> bool:
+    return (
+        enabled
+        and role in PI_STRUCTURED_ROLES
+        and isinstance(provider, OpenAICompatibleProvider)
+    )
+
+
 async def run_worker() -> None:
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -153,6 +195,10 @@ async def run_worker() -> None:
         if "BUSYGROUP" not in str(exc):
             raise
     runtimes = build_runtimes()
+    pi_bridge = PiAgentCoreBridge(
+        settings.pi_agent_core_bridge_path,
+        settings.pi_agent_core_timeout_seconds,
+    )
     logger.info("worker started: %s", worker_id)
     while True:
         claimed = await redis.xautoclaim(stream_name, group, worker_id, settings.task_lease_seconds * 1000, "0-0", count=1)
@@ -187,12 +233,47 @@ async def run_worker() -> None:
                 runtime = runtimes[agent_key_for_role(role)]
                 context = envelope["payload"].get("context", {})
                 try:
-                    if _should_run_developer_tool_loop(
+                    if _should_run_pi_clarifier(
+                        role,
+                        context,
+                        runtime.provider,
+                        settings.pi_agent_core_enabled,
+                        settings.repository_automation_enabled,
+                    ):
+                        output, response = await PiClarificationToolLoop(
+                            runtime.provider,
+                            pi_bridge,
+                            settings.workspace_root,
+                            settings.pi_clarifier_max_turns,
+                        ).run(context)
+                    elif _should_run_pi_structured_role(
+                        role,
+                        runtime.provider,
+                        settings.pi_agent_core_enabled,
+                    ):
+                        output, response = await PiStructuredRoleLoop(
+                            runtime.provider,
+                            pi_bridge,
+                            settings.workspace_root,
+                            role,
+                            settings.pi_structured_role_max_turns,
+                        ).run(context)
+                    elif _should_run_developer_tool_loop(
                         role,
                         context,
                         settings.repository_automation_enabled,
                     ):
-                        output, response = await DeveloperToolLoop(runtime.provider).run(context)
+                        if (
+                            settings.pi_agent_core_enabled
+                            and isinstance(runtime.provider, OpenAICompatibleProvider)
+                        ):
+                            output, response = await PiDeveloperToolLoop(
+                                runtime.provider,
+                                pi_bridge,
+                                settings.pi_developer_max_turns,
+                            ).run(context)
+                        else:
+                            output, response = await DeveloperToolLoop(runtime.provider).run(context)
                     else:
                         verification = []
                         if role in ACCEPTANCE_ROLES:
@@ -204,11 +285,22 @@ async def run_worker() -> None:
                             context,
                             settings.repository_automation_enabled,
                         ):
-                            output, response = await AcceptanceToolLoop(
-                                runtime.provider,
-                                role,
-                                images=runtime.load_images(context),
-                            ).run(context)
+                            if (
+                                settings.pi_agent_core_enabled
+                                and isinstance(runtime.provider, OpenAICompatibleProvider)
+                            ):
+                                output, response = await PiAcceptanceToolLoop(
+                                    runtime.provider,
+                                    pi_bridge,
+                                    role,
+                                    settings.pi_acceptance_max_turns,
+                                ).run(context)
+                            else:
+                                output, response = await AcceptanceToolLoop(
+                                    runtime.provider,
+                                    role,
+                                    images=runtime.load_images(context),
+                                ).run(context)
                         else:
                             output, response = await runtime.run(role, context)
                         if verification and any(item.get("status") != "passed" for item in verification):
@@ -221,6 +313,8 @@ async def run_worker() -> None:
                         "token_usage": response.prompt_tokens + response.completion_tokens,
                         "model": response.model,
                     }
+                    if response.diagnostics is not None:
+                        result["diagnostics"] = response.diagnostics
                 except (ModelProviderError, AgentOutputError) as exc:
                     result = _agent_failure_result(
                         envelope["task_id"],
