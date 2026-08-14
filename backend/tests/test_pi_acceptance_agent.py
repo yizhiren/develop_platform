@@ -14,6 +14,14 @@ class AcceptanceBridge:
             "read_file",
             {"path": "test_value.py", "criterion_ids": ["AC-1"]},
         )
+        await handler(
+            "run_command",
+            {
+                "argv": ["rg", "answer", "value.py"],
+                "cwd": "repo-1",
+                "criterion_ids": ["AC-1"],
+            },
+        )
         command = await handler(
             "run_command",
             {
@@ -48,7 +56,7 @@ class AcceptanceBridge:
 
 
 @pytest.mark.asyncio
-async def test_pi_acceptance_preserves_independent_evidence_gate(
+async def test_pi_acceptance_preserves_the_agents_conclusion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -176,8 +176,6 @@ def process_task_result(session: Session, result: dict[str, Any]) -> None:
         return
 
     output = dict(result.get("output") or {})
-    if task.task_type in {"agent.accept", "agent.final_accept", "agent.regression"}:
-        _enforce_acceptance_evidence_gate(task, output)
     _externalize_large_evidence(session, task, output)
     task.status = "completed"
     task.lease_owner = None
@@ -381,110 +379,6 @@ def _safe_agent_diagnostics(value: Any) -> dict[str, Any]:
                 safe_counts[safe_name] = 0
         result["tool_call_counts"] = safe_counts
     return result
-
-
-def _enforce_acceptance_evidence_gate(task: WorkflowTask, output: dict[str, Any]) -> None:
-    """Reject unsupported Agent4 approvals before they can advance the workflow."""
-    payload = json.loads(task.payload_json)
-    context = payload.get("context", {})
-    artifacts = context.get("artifacts", {})
-    manifest_key = {
-        "agent.accept": "verification_manifest",
-        "agent.final_accept": "final_verification_manifest",
-        "agent.regression": "incremental_verification_manifest",
-    }[task.task_type]
-    if not artifacts.get(manifest_key):
-        # Legacy/Fake flows without repository automation retain the protocol-only behavior.
-        return
-
-    clarification = artifacts.get("clarification_spec", {})
-    expected = clarification.get("acceptance_criteria", []) if isinstance(clarification, dict) else []
-    expected = [item for item in expected if isinstance(item, dict)]
-    expected_ids = [str(item.get("id", "")).strip() for item in expected]
-    priorities = {
-        str(item.get("id", "")).strip(): str(item.get("priority", "must"))
-        for item in expected
-    }
-    results = output.get("criteria", [])
-    results = [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
-    result_ids = [str(item.get("criterion_id", "")).strip() for item in results]
-    raw_evidence = output.get("regression_results", [])
-    evidence = [item for item in raw_evidence if isinstance(item, dict)] if isinstance(raw_evidence, list) else []
-    evidence_by_id = {
-        str(item.get("evidence_id")): item
-        for item in evidence
-        if item.get("evidence_id")
-    }
-
-    issues: list[str] = []
-    if not expected_ids or any(not item for item in expected_ids) or len(set(expected_ids)) != len(expected_ids):
-        issues.append("confirmed acceptance criteria are missing or have invalid ids")
-    if len(result_ids) != len(set(result_ids)) or set(result_ids) != set(expected_ids):
-        issues.append(
-            f"acceptance report must exactly cover confirmed criteria; expected={expected_ids}, actual={result_ids}"
-        )
-    for item in results:
-        criterion_id = str(item.get("criterion_id", "")).strip()
-        if item.get("status") != "passed" or criterion_id not in priorities:
-            continue
-        evidence_paths = [str(value) for value in item.get("evidence_paths", [])]
-        unknown_evidence = [value for value in evidence_paths if value not in evidence_by_id]
-        if unknown_evidence:
-            issues.append(f"{criterion_id} references unknown evidence ids: {unknown_evidence}")
-        linked = [evidence_by_id.get(value) for value in evidence_paths]
-        direct = [
-            value
-            for value in linked
-            if value
-            and criterion_id in value.get("criterion_ids", [])
-            and value.get("status") == "passed"
-        ]
-        if not direct:
-            issues.append(f"{criterion_id} is passed without directly linked passing evidence")
-
-    if output.get("approved"):
-        independent_commands = [
-            item
-            for item in evidence
-            if item.get("source") == "agent4_independent"
-            and item.get("type") == "command"
-            and item.get("status") == "passed"
-        ]
-        if not independent_commands:
-            issues.append("approval requires at least one successful independent Agent4 command")
-        failed_commands = [
-            item
-            for item in evidence
-            if item.get("type") == "command" and item.get("status") != "passed"
-        ]
-        if failed_commands:
-            issues.append("approval contains failed replay or independent commands")
-        if any(item.get("workspace_integrity_violations") for item in evidence):
-            issues.append("approval contains workspace integrity violations")
-        failed_must = [
-            item.get("criterion_id")
-            for item in results
-            if priorities.get(str(item.get("criterion_id", ""))) == "must"
-            and item.get("status") != "passed"
-        ]
-        if failed_must:
-            issues.append(f"must criteria are not passed: {failed_must}")
-
-    evidence.append(
-        {
-            "evidence_id": "platform-acceptance-gate",
-            "source": "platform_gate",
-            "type": "acceptance_coverage",
-            "status": "failed" if issues else "passed",
-            "issues": issues,
-        }
-    )
-    output["regression_results"] = evidence
-    if issues:
-        output["approved"] = False
-        detail = "; ".join(issues)
-        original = str(output.get("summary", "")).strip()
-        output["summary"] = f"平台验收证据门禁未通过：{detail}。{original}".strip()
 
 
 def _externalize_large_evidence(

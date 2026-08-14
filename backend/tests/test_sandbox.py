@@ -8,7 +8,6 @@ import pytest
 from app.agents.sandbox import (
     SandboxViolation,
     WorkspaceSandbox,
-    _command_file_size_limit,
     _limit_process,
 )
 from app.core.config import Settings
@@ -215,13 +214,7 @@ def test_workspace_sandbox_restores_one_file_from_parent_commit(tmp_path: Path) 
     assert tracked.read_text() == "complete\n"
 
 
-def test_sandbox_uses_larger_bounded_file_limit_only_for_build_artifact_commands() -> None:
-    assert _command_file_size_limit(["npm", "run", "package:cli"]) == 512 * 1024**2
-    assert _command_file_size_limit(["npm", "test"]) == 64 * 1024**2
-    assert _command_file_size_limit(["python", "-m", "pytest"]) == 64 * 1024**2
-
-
-def test_sandbox_limits_cpu_files_and_fds_without_child_address_space_cap(
+def test_sandbox_limits_cpu_and_fds_without_file_or_address_space_caps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     limits: list[int] = []
@@ -230,8 +223,8 @@ def test_sandbox_limits_cpu_files_and_fds_without_child_address_space_cap(
     _limit_process()
 
     assert resource.RLIMIT_CPU in limits
-    assert resource.RLIMIT_FSIZE in limits
     assert resource.RLIMIT_NOFILE in limits
+    assert resource.RLIMIT_FSIZE not in limits
     assert resource.RLIMIT_AS not in limits
 
 

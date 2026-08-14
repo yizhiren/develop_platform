@@ -357,7 +357,11 @@ const workflowTimelineLabels: Record<string, string> = {
   changes_committed: "创建本地提交",
   changes_published: "推送评审分支",
   verification_ready: "准备验收环境",
+  verification_dependencies_ready: "准备验收依赖",
   incremental_verification_ready: "准备组合回归环境",
+  incremental_verification_dependencies_ready: "准备组合回归依赖",
+  final_verification_ready: "准备最终验收环境",
+  final_verification_dependencies_ready: "准备最终验收依赖",
   all_repositories_merged: "完成仓库合并",
   repository_merged: "完成单仓合并",
   automation_failed: "仓库自动化失败",
@@ -375,7 +379,11 @@ const platformTimelineEvents = new Set([
   "changes_committed",
   "changes_published",
   "verification_ready",
+  "verification_dependencies_ready",
   "incremental_verification_ready",
+  "incremental_verification_dependencies_ready",
+  "final_verification_ready",
+  "final_verification_dependencies_ready",
   "all_repositories_merged",
   "repository_merged",
   "automation_failed",
@@ -852,6 +860,7 @@ export default function Home() {
   const [showProject, setShowProject] = useState(false);
   const [showRepository, setShowRepository] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAllRequirements, setShowAllRequirements] = useState(false);
   const [editingRepository, setEditingRepository] =
     useState<Repository | null>(null);
   const [selectedRequirement, setSelectedRequirement] =
@@ -1003,6 +1012,7 @@ export default function Home() {
     setSelectedRequirement(null);
     setShowRepository(false);
     setShowCreate(false);
+    setShowAllRequirements(false);
     setLoadedProjectId(null);
     setError("");
   }
@@ -1266,9 +1276,19 @@ export default function Home() {
                   <p className="eyebrow">DELIVERY PIPELINE</p>
                   <h2>需求运行中</h2>
                 </div>
-                <button className="text-button">查看全部 →</button>
+                {requirements.length > 5 && (
+                  <button
+                    className="text-button"
+                    type="button"
+                    aria-expanded={showAllRequirements}
+                    aria-controls="requirement-list"
+                    onClick={() => setShowAllRequirements((current) => !current)}
+                  >
+                    {showAllRequirements ? "收起 ↑" : "查看全部 →"}
+                  </button>
+                )}
               </div>
-              <div className="requirement-list">
+              <div className="requirement-list" id="requirement-list">
                 {projectDataLoading ? (
                   <LoadingState label="正在加载当前项目的需求…" />
                 ) : requirements.length === 0 ? (
@@ -1279,7 +1299,7 @@ export default function Home() {
                   />
                 ) : (
                   requirements
-                    .slice(0, 5)
+                    .slice(0, showAllRequirements ? requirements.length : 5)
                     .map((item) => (
                       <RequirementRow
                         key={item.id}
@@ -2310,6 +2330,9 @@ function RequirementDrawer({
     .slice()
     .sort((left, right) => left.merge_order - right.merge_order)
     .find((link) => link.status !== "merged");
+  const allRepositoriesMerged =
+    requirementRepositories.length > 0 &&
+    requirementRepositories.every((link) => link.status === "merged");
   const nextMergeRepository = repositories.find(
     (candidate) => candidate.id === nextMergeLink?.repository_id,
   );
@@ -2329,6 +2352,7 @@ function RequirementDrawer({
     !providerApiEnabled;
   const canBeginMerge =
     item.status !== "awaiting_merge" ||
+    allRepositoriesMerged ||
     Boolean(
       nextMergeLink?.head_sha &&
         nextMergeLink.pull_request_number &&
@@ -2903,7 +2927,9 @@ function RequirementDrawer({
                   disabled={busy}
                   onClick={() => act(event)}
                 >
-                  {label}
+                  {event === "begin_merge" && allRepositoriesMerged
+                    ? "重新执行最终验收"
+                    : label}
                 </button>
                 ))}
             </div>

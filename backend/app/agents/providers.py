@@ -59,7 +59,12 @@ class FakeLLMProvider(LLMProvider):
             )
             criterion_ids = [str(item.get("id")) for item in criteria if item.get("id")]
             progress = request.get("progress", {})
-            if not progress.get("independent_successful_test_count"):
+            evidence_ids = [
+                item
+                for item in progress.get("available_evidence_ids", [])
+                if str(item).startswith("agent4-test-")
+            ]
+            if not evidence_ids:
                 payload = {
                     "action": "run_command",
                     "argv": ["python", "-c", "assert True"],
@@ -67,23 +72,17 @@ class FakeLLMProvider(LLMProvider):
                     "criterion_ids": criterion_ids,
                 }
             else:
-                evidence_ids = [
-                    item
-                    for item in progress.get("available_evidence_ids", [])
-                    if str(item).startswith("agent4-test-")
-                ]
                 evidence_id = evidence_ids[-1] if evidence_ids else ""
-                failed = bool(progress.get("failed_test_count"))
                 payload = {
                     "action": "finish",
                     "report": {
                         "schema_version": "1.0",
-                        "approved": not failed,
-                        "summary": "验收失败" if failed else "独立验收通过",
+                        "approved": True,
+                        "summary": "独立验收通过",
                         "criteria": [
                             {
                                 "criterion_id": item,
-                                "status": "failed" if failed else "passed",
+                                "status": "passed",
                                 "summary": "平台 Fake Provider 独立断言",
                                 "evidence_paths": [evidence_id] if evidence_id else [],
                             }

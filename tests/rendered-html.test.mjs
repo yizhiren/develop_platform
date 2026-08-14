@@ -72,9 +72,18 @@ test("keeps the product metadata and security copy", async () => {
   assert.match(page, /task\.agent_run_id === null/);
   assert.match(page, /画板 \/ Git 正在执行/);
   assert.match(page, /analysis_ready: "读取仓库现状"/);
+  assert.match(page, /final_verification_ready: "准备最终验收环境"/);
+  assert.match(
+    page,
+    /final_verification_dependencies_ready: "准备最终验收依赖"/,
+  );
   assert.match(
     page,
     /const platformTimelineEvents = new Set\(\[[\s\S]*?"analysis_ready"[\s\S]*?\]\);/,
+  );
+  assert.match(
+    page,
+    /const platformTimelineEvents = new Set\(\[[\s\S]*?"final_verification_ready"[\s\S]*?"final_verification_dependencies_ready"[\s\S]*?\]\);/,
   );
   assert.match(page, /\/api\/v1\/requirements\/\$\{item\.id\}\/tasks/);
   assert.match(page, /完整审计日志/);
@@ -105,6 +114,15 @@ test("keeps the product metadata and security copy", async () => {
     /const platformTimelineEvents = new Set\(\[[\s\S]*?"confirm_plan"[\s\S]*?\]\);/,
   );
   assert.match(page, /批准方案并开始开发/);
+  assert.match(page, /allRepositoriesMerged/);
+  assert.match(page, /重新执行最终验收/);
+  assert.match(page, /setShowAllRequirements/);
+  assert.match(page, /aria-expanded=\{showAllRequirements\}/);
+  assert.match(page, /showAllRequirements \? "收起 ↑" : "查看全部 →"/);
+  assert.match(
+    page,
+    /\.slice\(0, showAllRequirements \? requirements\.length : 5\)/,
+  );
   assert.match(page, /要求系统架构师调整/);
   assert.match(page, /目标方案/);
   assert.match(page, /回滚方案/);

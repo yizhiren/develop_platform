@@ -158,7 +158,7 @@ async def test_acceptance_agent_independently_inspects_tests_and_covers_every_cr
 
 
 @pytest.mark.asyncio
-async def test_acceptance_agent_rejects_incomplete_or_unsupported_pass_report(tmp_path: Path) -> None:
+async def test_acceptance_agent_preserves_its_submitted_pass_report(tmp_path: Path) -> None:
     repository = tmp_path / "repo-1"
     repository.mkdir()
     (repository / "value.py").write_text("VALUE = 1\n")
@@ -217,12 +217,13 @@ async def test_acceptance_agent_rejects_incomplete_or_unsupported_pass_report(tm
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path))
 
     assert report.approved is True
-    assert provider.users[2]["observation"]["type"] == "error"
-    assert "exactly cover" in " ".join(provider.users[2]["observation"]["issues"])
+    assert len(provider.users) == 2
+    assert [item.criterion_id for item in report.criteria] == ["AC-1"]
+    assert report.summary == "Incomplete report"
 
 
 @pytest.mark.asyncio
-async def test_acceptance_agent_does_not_let_blocked_should_criterion_veto_passed_musts(
+async def test_acceptance_agent_preserves_its_rejection_for_a_blocked_should_criterion(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo-1"
@@ -276,14 +277,13 @@ async def test_acceptance_agent_does_not_let_blocked_should_criterion_veto_passe
 
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path, criteria))
 
-    assert report.approved is True
+    assert report.approved is False
     assert len(provider.users) == 2
-    assert "平台门禁确认" in report.summary
-    assert "should 项 blocked 不得阻止 approved=true" in provider.systems[0]
+    assert report.summary == "Local must passed; external should is unavailable."
 
 
 @pytest.mark.asyncio
-async def test_acceptance_agent_repairs_platform_known_evidence_links(tmp_path: Path) -> None:
+async def test_acceptance_agent_preserves_its_evidence_links(tmp_path: Path) -> None:
     repository = tmp_path / "repo-1"
     repository.mkdir()
     (repository / "value.py").write_text("VALUE = 1\n")
@@ -324,12 +324,12 @@ async def test_acceptance_agent_repairs_platform_known_evidence_links(tmp_path: 
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path))
 
     assert report.approved is True
-    assert report.criteria[0].evidence_paths == ["agent4-test-1"]
-    assert report.criteria[1].evidence_paths == ["agent4-test-1"]
+    assert report.criteria[0].evidence_paths == ["hallucinated-id"]
+    assert report.criteria[1].evidence_paths == []
 
 
 @pytest.mark.asyncio
-async def test_acceptance_agent_falls_back_to_platform_report_after_repeated_invalid_finish(
+async def test_acceptance_agent_does_not_fall_back_to_a_platform_report(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repo-1"
@@ -357,15 +357,16 @@ async def test_acceptance_agent_falls_back_to_platform_report_after_repeated_inv
 
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path))
 
-    assert report.approved is True
-    assert len(provider.users) == 3
-    assert report.summary.startswith("Platform evidence gate approved")
-    assert {item.criterion_id for item in report.criteria} == {"AC-1", "AC-2"}
-    assert all(item.evidence_paths == ["agent4-test-1"] for item in report.criteria)
+    assert report.approved is False
+    assert len(provider.users) == 2
+    assert report.summary == "The model omitted the confirmed acceptance criteria."
+    assert report.criteria == []
 
 
 @pytest.mark.asyncio
-async def test_acceptance_agent_detects_a_command_that_changes_initial_source(tmp_path: Path) -> None:
+async def test_acceptance_agent_can_continue_after_a_command_changes_the_disposable_workspace(
+    tmp_path: Path,
+) -> None:
     repository = tmp_path / "repo-1"
     repository.mkdir()
     source = repository / "value.py"
@@ -391,16 +392,27 @@ async def test_acceptance_agent_detects_a_command_that_changes_initial_source(tm
                 "criterion_ids": ["AC-1"],
             },
             {
+                "action": "run_command",
+                "argv": [
+                    "python",
+                    "-c",
+                    "from pathlib import Path; "
+                    "assert Path('value.py').read_text() == 'VALUE = 2\\n'",
+                ],
+                "cwd": "repo-1",
+                "criterion_ids": ["AC-1"],
+            },
+            {
                 "action": "finish",
                 "report": {
-                    "approved": False,
-                    "summary": "Verification command changed the clean checkout.",
+                    "approved": True,
+                    "summary": "Agent completed validation in its disposable workspace.",
                     "criteria": [
                         {
                             "criterion_id": "AC-1",
-                            "status": "failed",
-                            "summary": "Workspace integrity violation",
-                            "evidence_paths": ["agent4-test-1"],
+                            "status": "passed",
+                            "summary": "Follow-up assertion passed.",
+                            "evidence_paths": ["agent4-test-2"],
                         }
                     ],
                     "regression_results": [],
@@ -412,9 +424,9 @@ async def test_acceptance_agent_detects_a_command_that_changes_initial_source(tm
 
     report, _ = await AcceptanceToolLoop(provider).run(acceptance_context(tmp_path, criteria))
 
-    assert report.approved is False
-    assert report.regression_results[0]["status"] == "failed"
-    assert report.regression_results[0]["workspace_integrity_violations"] == ["repo-1/value.py"]
+    assert report.approved is True
+    assert [item["status"] for item in report.regression_results] == ["passed", "passed"]
+    assert source.read_text() == "VALUE = 2\n"
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,32 @@ def session_with_requirement() -> tuple[Session, Requirement]:
     return session, requirement
 
 
+def add_requirement_repository(
+    session: Session,
+    requirement: Requirement,
+    status: str = "pending",
+) -> RequirementRepository:
+    repository = RepositoryConnection(
+        project_id=requirement.project_id,
+        provider="github",
+        external_id=f"repo-{requirement.id}-{status}",
+        full_name="acme/example",
+        clone_url="git@github.com:acme/example.git",
+        web_url="https://github.com/acme/example",
+    )
+    session.add(repository)
+    session.flush()
+    link = RequirementRepository(
+        requirement_id=requirement.id,
+        repository_id=repository.id,
+        target_branch="main",
+        status=status,
+    )
+    session.add(link)
+    session.flush()
+    return link
+
+
 def complete_dependency_preparation(session: Session, requirement: Requirement) -> WorkflowTask:
     task = session.scalars(
         select(WorkflowTask).where(
@@ -805,6 +831,80 @@ def test_blocked_acceptance_retry_rebuilds_clean_verification_workspace(monkeypa
     assert task is not None and task.task_type == "git.prepare_verification"
     assert requirement.status == RequirementStatus.ACCEPTING
     assert requirement.acceptance_failures == 0
+
+
+def test_blocked_final_acceptance_retry_returns_to_final_verification(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    add_requirement_repository(session, requirement, "merged")
+    requirement.status = RequirementStatus.BLOCKED
+    session.add(
+        WorkflowTransition(
+            requirement_id=requirement.id,
+            from_status=RequirementStatus.FINAL_ACCEPTANCE.value,
+            to_status=RequirementStatus.BLOCKED.value,
+            event="final_acceptance_failed",
+            actor_type="agent",
+        )
+    )
+    session.flush()
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "retry_acceptance",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.FINAL_ACCEPTANCE
+    assert task is not None and task.task_type == "git.prepare_final_verification"
+
+
+def test_acceptance_approval_skips_merge_when_all_repositories_are_already_merged(
+    monkeypatch,
+) -> None:
+    session, requirement = session_with_requirement()
+    add_requirement_repository(session, requirement, "merged")
+    requirement.status = RequirementStatus.ACCEPTING
+    session.flush()
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "acceptance_approved",
+        requirement.version,
+        "agent",
+        "acceptance-run",
+    )
+
+    assert requirement.status == RequirementStatus.FINAL_ACCEPTANCE
+    assert task is not None and task.task_type == "git.prepare_final_verification"
+
+
+def test_begin_merge_self_heals_when_all_repositories_are_already_merged(monkeypatch) -> None:
+    session, requirement = session_with_requirement()
+    add_requirement_repository(session, requirement, "merged")
+    requirement.status = RequirementStatus.AWAITING_MERGE
+    session.flush()
+    settings = Settings(_env_file=None, repository_automation_enabled=True, llm_provider="fake")
+    monkeypatch.setattr("app.services.workflow.get_settings", lambda: settings)
+
+    task = transition_requirement(
+        session,
+        requirement,
+        "begin_merge",
+        requirement.version,
+        "user",
+        requirement.owner_id,
+    )
+
+    assert requirement.status == RequirementStatus.FINAL_ACCEPTANCE
+    assert task is not None and task.task_type == "git.prepare_final_verification"
 
 
 def test_plan_retry_restores_existing_workspace_then_prepares_dependencies(monkeypatch) -> None:

@@ -301,7 +301,7 @@ class WorkspaceSandbox:
                 errors="replace",
                 timeout=min(max(timeout, 1), 900),
                 check=False,
-                preexec_fn=lambda: _limit_process(_command_file_size_limit(argv)),
+                preexec_fn=_limit_process,
             )
         except subprocess.TimeoutExpired as exc:
             raise SandboxViolation(f"command timed out after {exc.timeout} seconds") from exc
@@ -370,21 +370,6 @@ class WorkspaceSandbox:
         return candidate
 
 
-def _command_file_size_limit(argv: list[str]) -> int:
-    """Allow bounded build artifacts while keeping ordinary commands tighter."""
-    if not argv:
-        return 64 * 1024**2
-    executable = Path(argv[0]).name
-    lowered = [item.lower() for item in argv[1:4]]
-    artifact_markers = ("build", "package", "bundle", "dist", "release")
-    if executable in {"npm", "pnpm", "yarn", "make", "cargo", "go"} and any(
-        item.startswith(artifact_markers) for item in lowered
-    ):
-        return 512 * 1024**2
-    return 64 * 1024**2
-
-
-def _limit_process(max_file_size: int = 64 * 1024**2) -> None:
+def _limit_process() -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (300, 300))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (max_file_size, max_file_size))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))

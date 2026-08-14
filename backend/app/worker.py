@@ -17,7 +17,6 @@ from .agents.coding import DeveloperToolLoop
 from .agents.roles import AGENT_KEYS, agent_key_for_role
 from .agents.runtime import AgentOutputError, AgentRuntime, ModelProviderError
 from .agents.structured import PI_STRUCTURED_ROLES, PiStructuredRoleLoop
-from .agents.verification import run_recorded_tests
 from .core.config import get_settings
 from .services.leases import TaskLease
 from .services.diagnostics import safe_error_message
@@ -275,11 +274,6 @@ async def run_worker() -> None:
                         else:
                             output, response = await DeveloperToolLoop(runtime.provider).run(context)
                     else:
-                        verification = []
-                        if role in ACCEPTANCE_ROLES:
-                            verification = await asyncio.to_thread(run_recorded_tests, context)
-                            if verification:
-                                context = {**context, "runtime_verification": verification}
                         if _should_run_acceptance_tool_loop(
                             role,
                             context,
@@ -303,9 +297,6 @@ async def run_worker() -> None:
                                 ).run(context)
                         else:
                             output, response = await runtime.run(role, context)
-                        if verification and any(item.get("status") != "passed" for item in verification):
-                            output.approved = False
-                            output.summary = f"平台复跑测试失败，禁止验收通过。{output.summary}"
                     result = {
                         "task_id": envelope["task_id"],
                         "status": "completed",

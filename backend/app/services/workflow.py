@@ -322,6 +322,34 @@ def transition_requirement(
             )
         elif current == RequirementStatus.REVIEWING and event == "review_approved":
             rule = TransitionRule(RequirementStatus.REVIEWING, "git.publish_changes")
+        elif (
+            current == RequirementStatus.BLOCKED
+            and event == "retry_acceptance"
+            and _latest_blocked_from_status(session, requirement.id)
+            == RequirementStatus.FINAL_ACCEPTANCE
+        ):
+            rule = TransitionRule(
+                RequirementStatus.FINAL_ACCEPTANCE,
+                "git.prepare_final_verification",
+            )
+        elif (
+            current == RequirementStatus.ACCEPTING
+            and event == "acceptance_approved"
+            and _all_repositories_merged(session, requirement.id)
+        ):
+            rule = TransitionRule(
+                RequirementStatus.FINAL_ACCEPTANCE,
+                "git.prepare_final_verification",
+            )
+        elif (
+            current == RequirementStatus.AWAITING_MERGE
+            and event == "begin_merge"
+            and _all_repositories_merged(session, requirement.id)
+        ):
+            rule = TransitionRule(
+                RequirementStatus.FINAL_ACCEPTANCE,
+                "git.prepare_final_verification",
+            )
         elif current == RequirementStatus.MERGING and event == "all_repositories_merged":
             rule = TransitionRule(RequirementStatus.FINAL_ACCEPTANCE, "git.prepare_final_verification")
         elif current == RequirementStatus.MERGING and event == "repository_merged":
@@ -528,6 +556,35 @@ def _has_linked_repositories(session: Session, requirement_id: str) -> bool:
         .where(RequirementRepository.requirement_id == requirement_id)
         .limit(1)
     ) is not None
+
+
+def _all_repositories_merged(session: Session, requirement_id: str) -> bool:
+    statuses = session.scalars(
+        select(RequirementRepository.status).where(
+            RequirementRepository.requirement_id == requirement_id
+        )
+    ).all()
+    return bool(statuses) and all(status == "merged" for status in statuses)
+
+
+def _latest_blocked_from_status(
+    session: Session,
+    requirement_id: str,
+) -> RequirementStatus | None:
+    transition = session.scalar(
+        select(WorkflowTransition)
+        .where(
+            WorkflowTransition.requirement_id == requirement_id,
+            WorkflowTransition.to_status == RequirementStatus.BLOCKED.value,
+        )
+        .order_by(WorkflowTransition.created_at.desc(), WorkflowTransition.id.desc())
+    )
+    if transition is None:
+        return None
+    try:
+        return RequirementStatus(transition.from_status)
+    except ValueError:
+        return None
 
 
 def _has_usable_repository_analysis(session: Session, requirement_id: str) -> bool:
